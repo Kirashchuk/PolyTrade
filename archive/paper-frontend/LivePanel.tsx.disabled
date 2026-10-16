@@ -1,0 +1,72 @@
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js';
+import type { EIP1193Provider } from 'viem';
+import type { Book, Market, OrderInput } from '../shared/contracts';
+import type { BrowserLiveSession, LiveAccount, LiveAuditRow, LiveSessionStatus } from '../trading/live';
+import type { ExecutionQuote } from '../trading/math';
+import { session, shortAddress, stamp, usd } from './api';
+import { Badge, ErrorLine, Icon } from './ui';
+
+let activeSession: BrowserLiveSession | null = null;
+const object = (v: unknown): Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v) ? v as Record<string, unknown> : {};
+
+export function LivePanel(p: { market: Market | null; book: Book | null; enabled: boolean; ticket: () => OrderInput; ticketForm: JSX.Element }) {
+  const [state, setState] = createSignal<LiveSessionStatus | null>(activeSession?.status() ?? null);
+  const [account, setAccount] = createSignal<LiveAccount | null>(null);
+  const [accountAt, setAccountAt] = createSignal<number | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [message, setMessage] = createSignal<string | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const [authorizeConfirmed, setAuthorizeConfirmed] = createSignal(false);
+  const [review, setReview] = createSignal<{ input: OrderInput; market: Market; book: Book; quote: ExecutionQuote; at: number } | null>(null);
+  const [confirmed, setConfirmed] = createSignal(false);
+  const [cancelId, setCancelId] = createSignal('');
+  const [cancelConfirmed, setCancelConfirmed] = createSignal(false);
+  const [manualConfirmed, setManualConfirmed] = createSignal(false);
+  const [journal, setJournal] = createSignal<LiveAuditRow[]>(activeSession?.journal() ?? []);
+  const update = () => { setState(activeSession?.status() ?? null); setJournal(activeSession?.journal() ?? []); };
+  onMount(() => { const timer = setInterval(update, 1_000); onCleanup(() => clearInterval(timer)); });
+  const action = async (fn: () => Promise<void>) => { if (busy()) return; setBusy(true); setError(null); setMessage(null); try { await fn(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); update(); } };
+  const connect = () => void action(async () => {
+    const provider = (window as unknown as { ethereum?: EIP1193Provider }).ethereum;
+    if (!provider) throw new Error('No injected EVM wallet found. Open this workspace in a browser with an EVM wallet extension.');
+    if (!activeSession) { const { createLiveSession } = await import('../trading/live'); const local = await session(); if (!local.liveEnabled) throw new Error('The local live relay is disabled.'); activeSession = createLiveSession({ provider, token: local.token }); }
+    await activeSession.connect();
+  });
+  const authorize = () => void action(async () => { if (!authorizeConfirmed()) throw new Error('Review the proxy authorization first.'); await activeSession!.authorize(60); setAuthorizeConfirmed(false); setMessage('Proxy authorized for 60 minutes. It can sign real trading operations.'); });
+  const read = () => void action(async () => { setAccount(await activeSession!.readAccount()); setAccountAt(Date.now()); setMessage('Private account observations refreshed.'); });
+  const prepare = () => void action(async () => {
+    if (!p.market || !p.book) throw new Error('A fresh official market and book are required.');
+    const input = p.ticket();
+    const current = await activeSession!.readAccount(); setAccount(current); setAccountAt(Date.now());
+    const position = Array.isArray(object(current.portfolio).positions) ? (object(current.portfolio).positions as unknown[]).map(object).find(x => x.instrument_id === input.instrumentId) : null;
+    const { estimateOrder } = await import('../trading/math');
+    const quote = estimateOrder(input, p.market, p.book, typeof position?.size === 'string' ? position.size : '0');
+    setReview({ input, market: structuredClone(p.market), book: structuredClone(p.book), quote, at: Date.now() }); setConfirmed(false);
+  });
+  const submit = () => void action(async () => {
+    const reviewed = review();
+    if (!reviewed || !confirmed()) throw new Error('Review and confirm the real order first.');
+    if (!p.book || !p.market || p.market.id !== reviewed.input.instrumentId) throw new Error('The selected market changed. Review again.');
+    if (Date.now() - reviewed.at > 15_000) { setReview(null); throw new Error('The review expired after 15 seconds. Refresh the quote and review again.'); }
+    const result = await activeSession!.submit(reviewed.input, reviewed.market, reviewed.book, true);
+    setMessage(result.message); setReview(null); setConfirmed(false);
+  });
+  const reconcile = () => void action(async () => { const result = await activeSession!.reconcile(); setAccount(result); setAccountAt(Date.now()); setMessage(result.resolved ? 'Official order state reconciled. The session is ready for review.' : 'The outcome remains unresolved. No new signed write is allowed.'); });
+  const cancel = () => void action(async () => { if (!cancelConfirmed()) throw new Error('Explicitly confirm cancellation first.'); const outcome = await activeSession!.cancel(Number(cancelId()), true); setMessage(outcome.message); setCancelConfirmed(false); });
+  const instrumentId = createMemo(() => p.market?.id ?? null);
+  createEffect(() => { instrumentId(); setReview(null); setConfirmed(false); });
+  return <div class="live-panel"><div class="panel-heading"><h2>Live exchange account</h2><Badge tone={p.enabled ? 'mint' : ''}>{p.enabled ? 'OPT-IN' : 'DISABLED'}</Badge></div><p class="live-description">Connect a registered EVM signer on Polygon. Your wallet authorizes a temporary proxy; the proxy signs trading operations in this browser.</p><Show when={!p.enabled}><div class="live-unknown">The live relay is disabled on this installation. Enable it in the local service configuration to use wallet authorization and reviewed trading.</div><a href="#system" class="button subtle full-width"><Icon name="system" size={14}/>View system status</a></Show>
+    <div class="live-session"><div><span>Wallet signer</span><strong class="mono" title={state()?.owner ?? ''}>{state()?.owner ? shortAddress(state()!.owner!) : 'Disconnected'}</strong></div><div><span>Proxy session</span><strong class="mono" title={state()?.proxy ?? ''}>{state()?.authorized ? shortAddress(state()!.proxy!) : 'Not authorized'}</strong></div><div><span>Expires at</span><strong class="mono">{state()?.expiresAt ? stamp(state()!.expiresAt) : '—'}</strong></div></div>
+    <ErrorLine error={error()}/><Show when={message()}><div class="success-line" role="status">{message()}</div></Show>
+    <div class="live-actions"><Show when={!state()?.connected} fallback={<button class="button subtle full-width" disabled={busy()} onClick={() => { activeSession?.disconnect(); setAccount(null); setAccountAt(null); setReview(null); update(); }}>Disconnect & clear credentials</button>}><button class="button primary full-width" disabled={!p.enabled || busy()} onClick={connect}><Icon name="wallet" size={14}/>{busy() ? 'Connecting…' : 'Connect EVM wallet'}</button></Show><Show when={state()?.connected && !state()?.authorized}><label class="review-confirm"><input type="checkbox" checked={authorizeConfirmed()} onChange={e => setAuthorizeConfirmed(e.currentTarget.checked)}/><span>I authorize a proxy that can submit real trading operations for 60 minutes.</span></label><button class="button subtle full-width" disabled={!p.enabled || busy() || !authorizeConfirmed()} onClick={authorize}>Authorize 60-minute proxy</button></Show><Show when={state()?.authorized}><button class="button subtle full-width" disabled={busy()} onClick={read}><Icon name="refresh" size={13}/>Refresh private account</button></Show></div>
+    <Show when={state()?.pending}><div class="live-unknown"><strong>Signed write awaiting reconciliation</strong><p>{state()!.pending!.action} · {state()!.pending!.orderId ?? state()!.pending!.clientOrderId}</p><p>Do not resubmit. Acknowledgement does not prove a fill.</p><button class="button subtle full-width" disabled={busy() || !state()?.authorized} onClick={reconcile}>Reconcile official order state</button></div></Show>
+    <Show when={state()?.blockedReason && state()?.connected}><p class="live-description">{state()?.blockedReason}</p></Show>
+    <Show when={state()?.authorized && !state()?.pending}>{p.ticketForm}<button class="button primary full-width" disabled={busy() || !p.market || !p.book} onClick={prepare}>Review real order <Icon name="arrow" size={14}/></button></Show>
+    <Show when={review()}>{r => <div class="live-review"><h3>Review real exchange order</h3><div><span>Instrument</span><strong>{r().market.displaySymbol}</strong></div><div><span>Side / type</span><strong>{r().input.side} / {r().input.type}</strong></div><div><span>Exact quantity</span><strong>{r().input.quantity}</strong></div><div><span>Limit / IOC bound</span><strong>{r().quote.limitPrice}</strong></div><div><span>Displayed executable size</span><strong>{r().quote.filledQuantity}</strong></div><div><span>Estimated notional</span><strong>{usd(Number(r().quote.notional))}</strong></div><div><span>Leverage</span><strong>{r().input.leverage}×</strong></div><div><span>Reduce / post only</span><strong>{String(r().input.reduceOnly)} / {String(r().input.postOnly)}</strong></div><p>Review expires after 15 seconds. One signed submission is sent. Partial IOC execution is possible.</p><label class="review-confirm"><input type="checkbox" checked={confirmed()} onChange={e => setConfirmed(e.currentTarget.checked)}/><span>I confirm this real exchange order and its exact quantity, price bound and leverage.</span></label><button class="button primary full-width" disabled={busy() || !confirmed()} onClick={submit}>{busy() ? 'Submitting once…' : 'Sign & submit once'}</button><button class="text-button" onClick={() => setReview(null)}>Discard review</button></div>}</Show>
+    <Show when={account()}><details class="live-account-detail"><summary>Private account · {stamp(accountAt())}</summary><pre class="live-json">{JSON.stringify(account(), null, 2)}</pre></details></Show>
+    <Show when={state()?.authorized && !state()?.pending}><details class="live-cancel-detail"><summary>Cancel a real order</summary><p class="live-description">Use the exchange order ID from your private open-order snapshot.</p><label class="field-label">Exchange order ID<input aria-label="Live order ID to cancel" inputmode="numeric" value={cancelId()} onInput={e => setCancelId(e.currentTarget.value)}/></label><label class="review-confirm"><input type="checkbox" checked={cancelConfirmed()} onChange={e => setCancelConfirmed(e.currentTarget.checked)}/><span>I confirm cancellation of this real exchange order ID.</span></label><button class="button danger full-width" disabled={busy() || !cancelConfirmed() || !/^\d+$/.test(cancelId())} onClick={cancel}>Cancel order once</button></details></Show>
+    <Show when={state()?.connected && state()?.blockedReason && (state()?.pending || state()?.blockedReason?.toLowerCase().includes('registration outcome'))}><details class="live-cancel-detail"><summary>Manual reconciliation recovery</summary><p class="live-description">Inspect order history and proxy authorizations on the official terminal first. This acknowledgement clears the local block only.</p><label class="review-confirm"><input type="checkbox" checked={manualConfirmed()} onChange={e => setManualConfirmed(e.currentTarget.checked)}/><span>I checked this account on the official terminal and reconciled every unresolved order or proxy registration.</span></label><button class="button danger full-width" disabled={busy() || !manualConfirmed()} onClick={() => void action(async () => { await activeSession!.acknowledgeManualReconciliation(true); setManualConfirmed(false); setMessage('Operator acknowledged reconciliation on the official terminal.'); })}>Acknowledge official reconciliation</button></details></Show>
+    <Show when={journal().length}><details class="live-account-detail"><summary>Nonsecret intent journal</summary><div class="live-audit"><For each={[...journal()].reverse().slice(0, 12)}>{row => <div><time>{stamp(row.timestamp)}</time><span>{row.event.replaceAll('_', ' ')}</span></div>}</For></div></details></Show>
+    <p class="ticket-disclaimer">Proxy credentials stay in browser memory. Public intent metadata persists locally so an unknown write remains blocked after reload. Live fills belong to the exchange account, separate from the paper ledger.</p>
+  </div>;
+}
