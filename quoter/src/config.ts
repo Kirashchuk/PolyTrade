@@ -26,6 +26,7 @@ export interface Settings {
   sessions: Record<SessionName, SessionProfile> & { schedule: 'auto' | 'regular' };
   budget: { actionShare: number };
   metrics: { dir: string; flushS: number };
+  dashboard: { enabled: boolean; port: number };
 }
 
 type Obj = Record<string, unknown>;
@@ -57,14 +58,14 @@ export interface ConfigReport { settings: Settings; warnings: string[]; }
 
 export function parseSettings(input: unknown): ConfigReport {
   const root = obj(input, 'config'), warnings: string[] = [];
-  unknownKeys(root, ['instrument', 'mode', 'leverage', 'operator', 'egress', 'credentials', 'levels', 'requote', 'inventory', 'risk', 'deadman', 'sessions', 'budget', 'metrics'], 'config');
+  unknownKeys(root, ['instrument', 'mode', 'leverage', 'operator', 'egress', 'credentials', 'levels', 'requote', 'inventory', 'risk', 'deadman', 'sessions', 'budget', 'metrics', 'dashboard'], 'config');
   const instrument = root.instrument;
   if ((typeof instrument !== 'string' || !instrument.trim()) && !(typeof instrument === 'number' && Number.isSafeInteger(instrument))) throw new Error('config.instrument: expected a symbol (e.g. PLTR-USD) or instrument id');
 
   const operator = obj(root.operator, 'operator'), egress = obj(root.egress, 'egress'), credentials = obj(root.credentials, 'credentials');
   const requote = obj(root.requote, 'requote'), inventory = obj(root.inventory, 'inventory'), risk = obj(root.risk, 'risk');
   const vol = obj(risk.vol_breaker, 'risk.vol_breaker'), widen = obj(risk.post_only_reject_widen, 'risk.post_only_reject_widen');
-  const deadman = obj(root.deadman, 'deadman'), sessions = obj(root.sessions, 'sessions'), budget = obj(root.budget, 'budget'), metrics = obj(root.metrics, 'metrics');
+  const deadman = obj(root.deadman, 'deadman'), sessions = obj(root.sessions, 'sessions'), budget = obj(root.budget, 'budget'), metrics = obj(root.metrics, 'metrics'), dashboard = obj(root.dashboard, 'dashboard');
 
   if (!Array.isArray(root.levels) || !root.levels.length) throw new Error('config.levels: expected a nonempty list');
   const levels = root.levels.map((raw, index): LevelConfig => {
@@ -139,6 +140,7 @@ export function parseSettings(input: unknown): ConfigReport {
     },
     budget: { actionShare: num(budget, 'action_share', 'budget', 0.7, 0.05, 1) },
     metrics: { dir: str(metrics, 'dir', 'metrics', 'data'), flushS: num(metrics, 'flush_s', 'metrics', 60, 5, 3_600) },
+    dashboard: { enabled: bool(dashboard, 'enabled', 'dashboard', true), port: num(dashboard, 'port', 'dashboard', 4320, 1_024, 65_535) },
   };
   if (settings.deadman.rearmEveryS * 2 > settings.deadman.timeoutS) throw new Error('deadman.rearm_every_s must be at most half of deadman.timeout_s');
   if (settings.mode === 'live' && settings.risk.maxDailyLossUsd <= 0) warnings.push('risk.max_daily_loss_usd is 0: the daily loss stop is disabled');

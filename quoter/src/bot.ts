@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import type { Settings } from './config.ts';
 import type { Credentials } from './credentials.ts';
 import { Deadman, type AutoCancelStatus } from './deadman.ts';
-import { D } from './decimal.ts';
+import { D, type Dec } from './decimal.ts';
 import type { EgressPool } from './egress.ts';
 import { Executor, planActions, prioritize, TokenBucket } from './executor.ts';
 import { parseInstrument, type Instrument } from './instruments.ts';
@@ -15,6 +15,8 @@ import type { Clock, RestClient, WriteOutcome } from './rest.ts';
 import { rewardPeriodStart, type RestingQuote } from './rewards.ts';
 import { RiskManager } from './risk.ts';
 import { currentSession } from './sessions.ts';
+import type { SessionName } from './config.ts';
+import type { DashboardState, HistoryPoint, LadderRow, RunStatus } from './dashboard/types.ts';
 import { signOperation, type Operation } from './signer.ts';
 import { StateStore } from './state.ts';
 
@@ -50,6 +52,12 @@ export class QuoterBot {
   private exchangeCancelOnly = false;
   private instrumentHalted: string | null = null;
   private ladder: TargetLadder | null = null;
+  private runStatus: RunStatus = 'starting';
+  private statusReason = '';
+  private notes: string[] = [];
+  private session: SessionName = 'regular';
+  private readonly startedAt: number;
+  private readonly history: HistoryPoint[] = [];
   private lastPrinted = 0;
   private stopping: Promise<void> | null = null;
   private readonly now: () => number;
@@ -58,6 +66,7 @@ export class QuoterBot {
 
   constructor(private readonly o: BotOptions) {
     this.now = o.now ?? Date.now;
+    this.startedAt = this.now();
     this.mode = o.credentials ? 'live' : 'dry_run';
     const { settings, instrument, log } = o;
     this.state = new StateStore(instrument.id, instrument.symbol, this.now);
@@ -154,6 +163,7 @@ export class QuoterBot {
   private async shutdown(reason: string): Promise<void> {
     const { log } = this.o;
     log.warn('stopping', { reason });
+    this.runStatus = 'stopping'; this.statusReason = reason;
     this.running = false;
     for (const timer of this.timers) clearInterval(timer);
     if (this.cycleTimer) clearTimeout(this.cycleTimer);
@@ -167,6 +177,7 @@ export class QuoterBot {
     this.market.stop();
     this.privateStream?.stop();
     await this.metrics.flush(true);
+    this.runStatus = 'stopped'; this.statusReason = reason;
     this.finish(reason);
   }
 
@@ -258,6 +269,9 @@ export class QuoterBot {
       killSwitch: existsSync(this.o.stopFile),
     });
 
+    this.runStatus = { quote: 'running', pull: 'paused', freeze: 'frozen', halt: 'halted' }[action.kind] as RunStatus;
+    this.statusReason = action.kind === 'quote' ? '' : action.reason;
+    this.notes = action.kind === 'quote' ? action.notes : [];
     if (action.kind === 'halt') { this.ladder = null; void this.stop(action.reason === 'kill switch' ? 'kill switch' : `risk halt: ${action.reason}`); return; }
     if (action.kind === 'pull') {
       this.ladder = null;
@@ -281,6 +295,7 @@ export class QuoterBot {
     }
 
     const session = currentSession(this.now(), instrument.category, settings.sessions.schedule);
+    this.session = session;
     const ladder = computeLadder({
       market: { bestBid: market.bestBid!, bestAsk: market.bestAsk!, mid: market.mid! }, instrument,
       positionQty: account.positionQty, levels: settings.levels, requote: settings.requote, inventory: settings.inventory,
@@ -309,7 +324,11 @@ export class QuoterBot {
     const market: MarketState = this.market.snapshot();
     const quotes: RestingQuote[] = this.mode === 'live' ? this.state.restingQuotes()
       : market.status === 'live' && this.ladder ? this.ladder.quotes.map((q) => ({ side: q.side, price: q.price, rest: q.qty })) : [];
-    this.metrics.sample(market.status === 'live' ? market.mid : null, quotes, market.bids, market.asks);
+    const score = this.metrics.sample(market.status === 'live' ? market.mid : null, quotes, market.bids, market.asks);
+    const num = (value: { toNumber(): number } | null) => value ? value.toNumber() : null;
+    const best = (side: 'bid' | 'ask') => quotes.filter((q) => q.side === side).reduce<number | null>((acc, q) => { const p = q.price.toNumber(); return acc === null ? p : side === 'bid' ? Math.max(acc, p) : Math.min(acc, p); }, null);
+    this.history.push({ t: this.now(), mid: market.status === 'live' ? num(market.mid) : null, bid: num(market.bestBid), ask: num(market.bestAsk), ourBid: best('bid'), ourAsk: best('ask'), q: score > 0 ? 1 : 0 });
+    if (this.history.length > 600) this.history.shift();
   }
 
   private async refreshExchange(): Promise<void> {
@@ -340,6 +359,46 @@ export class QuoterBot {
       const mine = (rewards.data ?? []).map((day) => ({ date: day.date, reward: day.breakdown?.find((b) => b.instrument_id === this.o.instrument.id)?.reward_amount ?? null }));
       this.o.log.info('rewards', { makerShare7d: share ?? null, makerVolume7d: stats.maker_volume_7d ?? null, recent: mine, source: `${this.o.rest.base}/v1/account/rewards` });
     } catch (error) { this.o.log.warn('rewards poll failed', { error: errorText(error) }); }
+  }
+
+  /** Read-only snapshot for the local dashboard. Contains no keys, secrets or proxy credentials. */
+  dashboardState(): DashboardState {
+    const market = this.market.snapshot(), ladder = this.ladder, account = this.state.snapshot();
+    const mid = market.mid, t = this.now();
+    const bps = (price: Dec) => mid ? price.minus(mid).abs().div(mid).mul(10_000).toNumber() : null;
+    const rows: LadderRow[] = this.slots().map((slot) => {
+      const [side, level] = slot.split(':') as ['bid' | 'ask', string];
+      const target = ladder?.quotes.find((q) => q.slot === slot) ?? null;
+      const live = this.mode === 'live' ? this.state.forSlot(slot) : null;
+      return {
+        slot, side, level: Number(level), band: this.o.settings.levels[Number(level)]!.band,
+        target: target ? { price: target.price.toFixed(), qty: target.qty.toFixed(), notional: target.notional, distBps: target.distBps } : null,
+        live: live ? { price: live.price.toFixed(), rest: live.rest.toFixed(), filled: live.filled.toFixed(), status: live.status, inFlight: live.inFlight, distBps: bps(live.price) } : null,
+      };
+    });
+    const { settings, instrument, credentials } = this.o;
+    return {
+      now: t, mode: this.mode, instrument: { id: instrument.id, symbol: instrument.symbol, category: instrument.category },
+      status: this.runStatus, statusReason: this.statusReason, notes: this.notes, startedAt: this.startedAt, session: this.session,
+      egress: { primary: this.o.egress.describe(), feeds: this.market.routes() },
+      market: {
+        status: market.status, bid: market.bestBid?.toFixed() ?? null, ask: market.bestAsk?.toFixed() ?? null, mid: mid?.toFixed() ?? null,
+        spreadBps: mid && market.bestBid && market.bestAsk ? market.bestAsk.minus(market.bestBid).div(mid).mul(10_000).toNumber() : null,
+        ageMs: market.receivedAt === null ? null : t - market.receivedAt, source: market.source,
+      },
+      ladder: rows, skewBps: ladder?.skewBps ?? null,
+      account: this.mode === 'live' ? {
+        positionQty: account.positionQty.toFixed(), positionUsd: mid ? account.positionQty.mul(mid).toNumber() : null, entryPrice: account.entryPrice,
+        unrealizedPnl: account.unrealizedPnl, availableMargin: account.availableMargin, accountValue: account.accountValue,
+        dailyPnl: this.state.dailyPnl(rewardPeriodStart(t)), inLiquidation: account.inLiquidation,
+      } : null,
+      limits: { maxPositionUsd: settings.inventory.maxPositionUsd, maxDailyLossUsd: settings.risk.maxDailyLossUsd, minAvailableMarginUsd: settings.risk.minAvailableMarginUsd },
+      metrics: this.metrics.summary(),
+      history: [...this.history],
+      fills: this.state.fills.slice(-20).reverse().map((f) => ({ t: f.ts, side: f.side, price: f.price.toFixed(), qty: f.qty.toFixed(), fee: f.fee, taker: f.taker })),
+      deadmanDeadline: this.deadman?.deadline() || null,
+      credentialExpiresAt: credentials?.expiresAt ?? null,
+    };
   }
 
   private describe(ladder: TargetLadder, session: string, notes: string[]): string {

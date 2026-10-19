@@ -11,6 +11,7 @@ import { createLogger, errorText, type Level, type Logger } from './log.ts';
 import { Clock, REST_BASE, RestClient, WS_URL } from './rest.ts';
 import { signOperation } from './signer.ts';
 import { ManagedSocket } from './socket.ts';
+import { startDashboard, type DashboardHandle } from './dashboard/server.ts';
 
 const ROOT = resolve(import.meta.dir, '..');
 const USAGE = `Polymarket Perps liquidity quoter
@@ -71,12 +72,19 @@ async function credentialsFor(ctx: Context): Promise<Credentials> {
 
 async function runBot(ctx: Context, instrument: Instrument, credentials: Credentials | null): Promise<number> {
   const bot = new QuoterBot({ settings: ctx.settings, instrument, egress: ctx.egress, rest: ctx.rest, clock: ctx.clock, log: ctx.log.child(credentials ? 'live' : 'dry'), credentials, stopFile: join(ROOT, 'STOP') });
+  let dashboard: DashboardHandle | null = null;
+  if (ctx.settings.dashboard.enabled) {
+    try { dashboard = await startDashboard({ port: ctx.settings.dashboard.port, source: bot, log: ctx.log.child('dashboard') }); }
+    catch (error) { ctx.log.error('dashboard failed to start; quoting continues without it', { error: errorText(error) }); }
+  }
   const stop = (signal: string) => { void bot.stop(signal); };
   process.on('SIGINT', () => stop('SIGINT'));
   process.on('SIGTERM', () => stop('SIGTERM'));
   try { await bot.start(); }
-  catch (error) { ctx.log.error('startup failed', { error: errorText(error) }); await bot.stop('startup failure'); return 1; }
+  catch (error) { ctx.log.error('startup failed', { error: errorText(error) }); await bot.stop('startup failure'); dashboard?.stop(); return 1; }
   const reason = await bot.done;
+  await Bun.sleep(1_500); // let the panel show the final state
+  dashboard?.stop();
   ctx.log.info('stopped', { reason, metrics: bot.metrics.summary() });
   return reason.startsWith('risk halt') || reason === 'startup failure' ? 2 : 0;
 }

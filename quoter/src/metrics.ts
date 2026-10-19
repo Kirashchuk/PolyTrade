@@ -36,11 +36,12 @@ export class Metrics {
   }
   setMakerShare(pct: number | null): void { this.makerSharePct = pct; }
 
-  sample(mid: Dec | null, quotes: readonly RestingQuote[], bids: readonly Level[], asks: readonly Level[]): void {
+  /** Records one snapshot and returns its two-sided score (0 = not qualifying). */
+  sample(mid: Dec | null, quotes: readonly RestingQuote[], bids: readonly Level[], asks: readonly Level[]): number {
     const t = this.now(), period = rewardPeriodStart(t);
     if (period !== this.acc.periodStart) { void this.flush(true); this.acc = this.fresh(period); }
     this.acc.samples++;
-    if (!mid) return;
+    if (!mid) return 0;
     const own = bandNotional(quotes, mid, this.instrument.priceDecimals);
     const score = snapshotScore(own.bid, own.ask);
     if (score > 0) { this.acc.qualifying++; this.acc.scoreSum += score; }
@@ -58,6 +59,7 @@ export class Metrics {
       return out;
     };
     add(this.acc.bookBid, depth(bids, 'bid')); add(this.acc.bookAsk, depth(asks, 'ask'));
+    return score;
   }
 
   recordFills(fills: readonly FillRecord[]): void {

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Perps Quoter</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">PQ</span>
+      <div>
+        <div class="eyebrow">Polymarket Perps · Liquidity Rewards</div>
+        <h1><span id="symbol">—</span><span class="mode" id="mode">…</span></h1>
+      </div>
+    </div>
+    <div class="status" aria-live="polite">
+      <span class="pill" id="status" data-state="starting">підключення</span>
+      <span class="reason" id="reason"></span>
+    </div>
+    <div class="actions">
+      <span class="route" id="route" title="Маршрут до API"></span>
+      <button id="stop" class="danger" type="button" disabled>Зупинити</button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <main>
+    <section class="kpis" aria-label="Ключові показники">
+      <div class="kpi"><span class="k">Mid</span><span class="v" id="k-mid">—</span><span class="s" id="k-mid-s"></span></div>
+      <div class="kpi"><span class="k">Uptime за період</span><span class="v" id="k-up">—</span><span class="s" id="k-up-s"></span></div>
+      <div class="kpi"><span class="k">Liquidity score</span><span class="v" id="k-ls">—</span><span class="s" id="k-ls-s"></span></div>
+      <div class="kpi"><span class="k">Оцінка raw score</span><span class="v" id="k-raw">—</span><span class="s" id="k-raw-s"></span></div>
+      <div class="kpi"><span class="k">Позиція</span><span class="v" id="k-pos">—</span><span class="s" id="k-pos-s"></span></div>
+      <div class="kpi"><span class="k">PnL з 12:00 UTC</span><span class="v" id="k-pnl">—</span><span class="s" id="k-pnl-s"></span></div>
+    </section>
+
+    <section class="row">
+      <article class="card chart-card">
+        <div class="card-h">
+          <h2>Ціна і котирування · 10 хв</h2>
+          <div class="legend">
+            <span><i class="sw mid"></i>mid</span><span><i class="sw mkt"></i>ринок bid/ask</span>
+            <span><i class="sw ourbid"></i>наш bid</span><span><i class="sw ourask"></i>наш ask</span><span><i class="sw band"></i>±5 bps</span>
+          </div>
+        </div>
+        <div class="chart">
+          <svg id="chart" viewBox="0 0 1000 260" preserveAspectRatio="none" role="img" aria-label="Графік mid і власних котирувань"></svg>
+          <span class="axis hi" id="ax-hi"></span><span class="axis lo" id="ax-lo"></span>
+          <span class="axis left" id="ax-l"></span><span class="axis right">зараз</span>
+        </div>
+        <div class="strip-h"><span>Uptime: обидві сторони в межах 20 bps</span><span id="strip-pct"></span></div>
+        <svg class="strip" id="strip" viewBox="0 0 600 10" preserveAspectRatio="none" role="img" aria-label="Смуга uptime"></svg>
+      </article>
+
+      <article class="card ladder-card">
+        <div class="card-h"><h2>Сітка ордерів</h2><span class="aside" id="ladder-aside"></span></div>
+        <div class="tablewrap">
+          <table class="ladder">
+            <thead><tr><th>Сторона</th><th>Діап.</th><th class="r">Ціна</th><th class="r">К-сть</th><th class="r">$</th><th class="r">bps</th><th>Стан</th></tr></thead>
+            <tbody id="ladder"></tbody>
+          </table>
+        </div>
+        <p class="note" id="ladder-note"></p>
+      </article>
+    </section>
+
+    <section class="row three">
+      <article class="card">
+        <div class="card-h"><h2>Діапазони винагород</h2><span class="aside">кап $100k на сторону</span></div>
+        <div id="bands" class="bands"></div>
+        <p class="note">Смуга — середній власний notional відносно капу $100k на сторону. Праворуч — середня глибина інших учасників у тому ж діапазоні.</p>
+      </article>
+      <article class="card">
+        <div class="card-h"><h2>Події</h2><span class="aside" id="alerts-aside"></span></div>
+        <ol class="alerts" id="alerts"></ol>
+      </article>
+      <article class="card">
+        <div class="card-h"><h2>Система</h2></div>
+        <dl class="sys" id="system"></dl>
+        <h3>Виконання</h3>
+        <div class="tablewrap">
+          <table class="fills"><thead><tr><th>Час</th><th>Сторона</th><th class="r">Ціна</th><th class="r">К-сть</th><th class="r">Комісія</th></tr></thead><tbody id="fills"></tbody></table>
+        </div>
+      </article>
+    </section>
+  </main>
+  <footer>Локальна панель quoter · лише 127.0.0.1 · оновлення щосекунди</footer>
+</body>
+</html>

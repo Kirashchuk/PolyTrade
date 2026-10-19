@@ -20,6 +20,13 @@ export function redact(text: string): string {
   return result;
 }
 
+/** Observers of already-redacted log lines (the dashboard alert feed). */
+const listeners = new Set<(line: string, level: Level) => void>();
+export function onLog(listener: (line: string, level: Level) => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
 export interface Logger {
   debug(msg: string, data?: Record<string, unknown>): void;
   info(msg: string, data?: Record<string, unknown>): void;
@@ -37,7 +44,9 @@ export function createLogger(options: { level?: Level; scope?: string; sink?: (l
     let line: string;
     try { line = JSON.stringify({ t: new Date(now()).toISOString(), level, scope, msg, ...data }, (_key, value) => typeof value === 'bigint' ? value.toString() : value instanceof Error ? value.message : value); }
     catch { line = JSON.stringify({ t: new Date(now()).toISOString(), level, scope, msg }); }
-    sink(redact(line));
+    const redacted = redact(line);
+    sink(redacted);
+    for (const listener of listeners) { try { listener(redacted, level); } catch { /* a listener never breaks logging */ } }
   };
   const make = (scope: string | undefined): Logger => ({
     debug: (msg, data) => write(scope, 'debug', msg, data),

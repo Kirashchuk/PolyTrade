@@ -58,7 +58,7 @@ Proxy credentials live only in the gitignored `quoter/.env`. Logs mask proxy use
 
 ## Automated checks
 
-`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **53 tests, 0 failures, 915 assertions**.
+`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **56 tests, 0 failures, 944 assertions**.
 
 | Behavior | Evidence |
 |---|---|
@@ -70,13 +70,18 @@ Proxy credentials live only in the gitignored `quoter/.env`. Logs mask proxy use
 | State: order events, oid fallback, sequence gaps and false-gap guard, REST reconcile, position from portfolio plus newer fills, daily PnL | `quoter/test/stateRisk.test.ts` |
 | Risk: stale data pull, resync freeze, cancel-only, halts (liquidation, daily loss, settled, kill switch), volatility pause, margin scaling, post-only widen, proxy expiry | `quoter/test/stateRisk.test.ts` |
 | Egress parsing/redaction, read failover, write single attempt and outcome classification (5xx/timeout/unreadable = indeterminate), jurisdiction gate, config and `.env` secret refusal | `quoter/test/transport.test.ts` |
-| Full live lifecycle against a loopback mock exchange (REST + WS) with real signature verification: deadman armed, one signed ladder batch, modify-in-place after a mid move, cancelAll verified, auto-cancel disarmed | `quoter/test/liveMock.test.ts` |
+| Full live lifecycle against a loopback mock exchange (REST + WS) with real signature verification: deadman armed, one signed ladder batch, modify-in-place after a mid move, cancelAll verified, auto-cancel disarmed; dashboard state shows exchange-held orders and contains no secret or key | `quoter/test/liveMock.test.ts` |
+| Dashboard: loopback Host, Origin and `Sec-Fetch-Site` checks, CSP; Stop needs the process token, JSON and confirmation; redacted event feed | `quoter/test/dashboard.test.ts` |
 
 ## Real public data (read-only)
 
 `bun run probe` selected the fastest proxy, synced the clock, loaded PLTR-USD (id 45, price decimals 2, quantity decimals 4, min notional 10, max 200 orders) and received a live `bbo::45` frame through the proxy.
 
 `dry-run` ran for 3 minutes on PLTR-USD with two redundant public feeds (de1, de2). The default ladder ($1k per level at 3.5 / 8 / 17 bps) produced 175 samples with simulated uptime 1.0 and a liquidity score of about 1,343 per snapshot. Visible competing depth within the bands was about $1.15M / $0.34M / $0.05M per side. The STOP file shut the process down cleanly. An earlier run showed a public WebSocket via proxy hanging on connect, which led to the 10 s connect timeout and redundant feeds.
+
+## Dashboard
+
+The local panel at `http://127.0.0.1:4320` was checked in the in-app browser during a dry-run on PLTR-USD. It showed the DRY-RUN banner, status, live mid/spread, the simulated ladder at 3.8 / 8.4 / 17.1 bps, the 10-minute mid and quote chart with the uptime strip, band usage against the $100k cap with competing depth, events and feed status. At 375 px width the document did not overflow horizontally. The Stop button (confirmation accepted) stopped the process with reason `dashboard stop`, and the page then showed the stopped state.
 
 ## Limitations
 

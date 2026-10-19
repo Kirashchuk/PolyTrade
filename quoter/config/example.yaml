@@ -62,3 +62,7 @@ budget:
 metrics:
   dir: data                 # JSONL metrics (gitignored)
   flush_s: 60
+
+dashboard:                  # local panel at http://127.0.0.1:<port> (loopback only; Stop needs the per-process token)
+  enabled: true
+  port: 4320

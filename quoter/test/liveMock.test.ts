@@ -133,6 +133,14 @@ describe('live path against a local mock exchange', () => {
     const bids = [...exchange.orders.values()].filter((o) => o.buy).map((o) => o.p).sort();
     expect(bids).toEqual(['195.43', '195.6', '195.69']);
     await until(() => bot.state.restingQuotes().length === 6);
+    const view = bot.dashboardState();
+    expect(view.mode).toBe('live');
+    expect(view.ladder.filter((row) => row.live?.status === 'open')).toHaveLength(6);
+    expect(view.account?.accountValue).toBe(10_000);
+    expect(view.deadmanDeadline).toBeGreaterThan(Date.now());
+    const serialized = JSON.stringify(view);
+    expect(serialized).not.toContain('mock-secret');
+    expect(serialized.toLowerCase()).not.toContain(KEY.slice(2));
 
     exchange.bid = '195.86'; exchange.ask = '195.87'; // ~5 bps move
     await until(() => exchange.writes.some((w) => w.type === 'modifyOrdersCOID'));
