@@ -41,10 +41,14 @@ No live owner signature, proxy registration, order, funding transaction or withd
 
 Paper controls and polling are absent from the active frontend. Legacy `paper.ts`, `bots.ts`, simulator API routes and SQLite history remain for maintenance and regression tests. Their startup scheduler is frozen. Original UI source is retained under `archive/paper-frontend/` with noncompiled `.disabled` extensions. Enabling the live relay does not convert or replay legacy simulator activity.
 
+## Perps Quoter
+
+`quoter/` is a separate headless liquidity-rewards quoter (post-only GTC ladder within 0–5 / 5–10 / 10–20 bps, modify-based requotes, risk manager, exchange auto-cancel). All of its REST and WebSocket traffic goes through the egress proxies in `quoter/.env`. Start with `bun run probe` and `bun run dry-run` in `quoter/`; live mode requires `mode: live`, `--live` and a declared operator jurisdiction. See [quoter/README.md](quoter/README.md) and [ADR-0003](docs/adr/0003-perps-quoter.md).
+
 ## Design and checks
 
 See [live-only specification](specs/002-live-only/spec.md), [architecture decision](docs/adr/0002-live-only-browser-automation.md), [reference study](docs/reference-study.md) and [verification](docs/verification.md).
 
 Official [trading](https://docs.polymarket.com/perps/trading), [authenticated sessions](https://docs.polymarket.com/perps/authenticated-sessions), [OpenAPI](https://docs.polymarket.com/api-spec/perps-openapi.json), and [auto-cancel status](https://docs.polymarket.com/api-reference/get-auto-cancel-status) define the integration. Runtime data never falls back to the evidence captures in `artifacts/`.
 
-`bun run check` runs strict TypeScript, tests and the production build. `bun run probe` reads public endpoints only. For UI development use `bun run dev` and `bun run dev:web` in separate terminals. No public deployment is included.
+`bun run check` runs strict TypeScript, tests, the production build and the quoter check (strict TypeScript + tests). `bun run probe` reads public endpoints only. For UI development use `bun run dev` and `bun run dev:web` in separate terminals. No public deployment is included.

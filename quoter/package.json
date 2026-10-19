@@ -1,0 +1,18 @@
+{
+  "name": "polytrade-quoter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "description": "Liquidity-rewards quoter for Polymarket Perps. Uses the root PolyTrade dependencies (viem, @msgpack/msgpack, decimal.js).",
+  "scripts": {
+    "probe": "bun --no-env-file src/main.ts probe",
+    "dry-run": "bun --no-env-file src/main.ts dry-run",
+    "status": "bun --no-env-file src/main.ts status",
+    "start": "bun --no-env-file src/main.ts run --live",
+    "cancel-all": "bun --no-env-file src/main.ts cancel-all --live",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "bun --no-env-file test ./test",
+    "check": "bun run typecheck && bun run test"
+  }
+}

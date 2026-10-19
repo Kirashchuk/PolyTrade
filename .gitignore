@@ -20,3 +20,7 @@ artifacts/*
 *.tsbuildinfo
 Thumbs.db
 .DS_Store
+
+# quoter local state
+quoter/config/quoter.yaml
+quoter/STOP

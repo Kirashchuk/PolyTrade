@@ -45,3 +45,43 @@ Bots execute in the authorized browser, so the tab must remain open and awake. P
 Stop cancels and reconciles tracked orders before clearing native protection. If cleanup is unresolved, Stop releases local scheduling ownership for original-owner recovery but retains the durable unknown intent, owned client IDs and native protection. Manual new exposure remains blocked by the recovery journal until bot cleanup is complete. Reconnect/authorize the original owner, reconcile official order state and then use Stop/reconcile again. An expired ambiguous auto-cancel cannot be proven from a cleared deadline alone; inspect official orders, positions and timer state before the explicit operator acknowledgement. There is no automatic acknowledgement or resend.
 
 Legacy simulator APIs remain dormant for maintenance/regression use and cannot submit upstream writes. No reference checkout was changed and no public deployment was performed.
+
+# Perps Quoter — 19 October 2026
+
+`quoter/` implements the liquidity-rewards quoter from `perps-quoter-architecture.md` as a separate headless Bun process. Decision record: [ADR-0003](adr/0003-perps-quoter.md). No live owner signature, proxy registration, order, cancellation or auto-cancel was sent to the real exchange.
+
+## Network and egress
+
+On 2026-10-19 a direct request from this machine to `https://api.perpetuals.polymarket.com/v1/info/time` did not connect (curl HTTP 000). Through each of the three configured HTTP proxies (two DE, one PL) it returned HTTP 200 in about 0.45–0.6 s. Bun 1.3.14 `fetch(url, {proxy})` and `new WebSocket(url, {proxy})` both work through them. A 3-minute concurrent WebSocket test (one connection per proxy, `bbo::45`) saw one `1006` tunnel drop on one proxy. The longest gap between BBO frames was about 4.9 s on all routes at once, which reflects market quiet rather than transport. The local clock was 2.9 s behind server time; signatures use the measured offset.
+
+Proxy credentials live only in the gitignored `quoter/.env`. Logs mask proxy user/password, keys, secrets and signatures (`test/transport.test.ts`).
+
+## Automated checks
+
+`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **53 tests, 0 failures, 915 assertions**.
+
+| Behavior | Evidence |
+|---|---|
+| Decimal grid (price/quantity decimals and ≤5 significant digits), decade carry, exact strings | `quoter/test/rounding.test.ts` |
+| Reward bands with outward-rounded edges, $100k cap, harmonic mean, maker score, 12:00 UTC period | `quoter/test/rounding.test.ts` |
+| Ladder distances, band containment after skew/session widening, post-only clamp, position stop (zero/shrink), min notional, cap warning | `quoter/test/quoteEngine.test.ts` |
+| Compact operations equal the documented forms (createOrders, modifyOrdersCOID, cancelOrdersCOID, cancelAll, autoCancel, updateLeverage); EIP-712 signature recovers to the proxy | `quoter/test/signer.test.ts` |
+| Slot diff (place/modify/cancel/wait), fills included in modify quantity, budget priority, one attempt per signed batch, indeterminate halts writes, whole-request rejection | `quoter/test/executorDiff.test.ts` |
+| State: order events, oid fallback, sequence gaps and false-gap guard, REST reconcile, position from portfolio plus newer fills, daily PnL | `quoter/test/stateRisk.test.ts` |
+| Risk: stale data pull, resync freeze, cancel-only, halts (liquidation, daily loss, settled, kill switch), volatility pause, margin scaling, post-only widen, proxy expiry | `quoter/test/stateRisk.test.ts` |
+| Egress parsing/redaction, read failover, write single attempt and outcome classification (5xx/timeout/unreadable = indeterminate), jurisdiction gate, config and `.env` secret refusal | `quoter/test/transport.test.ts` |
+| Full live lifecycle against a loopback mock exchange (REST + WS) with real signature verification: deadman armed, one signed ladder batch, modify-in-place after a mid move, cancelAll verified, auto-cancel disarmed | `quoter/test/liveMock.test.ts` |
+
+## Real public data (read-only)
+
+`bun run probe` selected the fastest proxy, synced the clock, loaded PLTR-USD (id 45, price decimals 2, quantity decimals 4, min notional 10, max 200 orders) and received a live `bbo::45` frame through the proxy.
+
+`dry-run` ran for 3 minutes on PLTR-USD with two redundant public feeds (de1, de2). The default ladder ($1k per level at 3.5 / 8 / 17 bps) produced 175 samples with simulated uptime 1.0 and a liquidity score of about 1,343 per snapshot. Visible competing depth within the bands was about $1.15M / $0.34M / $0.05M per side. The STOP file shut the process down cleanly. An earlier run showed a public WebSocket via proxy hanging on connect, which led to the 10 s connect timeout and redundant feeds.
+
+## Limitations
+
+- The live path is verified only against the mock exchange. Real acceptance of signatures, modify semantics, private `sq` numbering, `orders` event fields and margin reservation for opposite resting orders remain unverified until the account owner runs `status` and a $1k-per-level live session (spec §15, stage 6).
+- The jurisdiction gate relies on the operator's declaration. It blocks the officially restricted countries and regions before any signature. The egress country is not considered.
+- Private sequence gaps trigger a REST reconcile. If gaps are routine, detection is disabled for that connection and the 30 s periodic reconcile remains.
+- Equity session profiles follow the NYSE weekly schedule without holidays.
+- Pause/stop use `cancelAll` on the quoted instrument, and `autoCancel` is account-wide, so manual orders on the account can be affected.
