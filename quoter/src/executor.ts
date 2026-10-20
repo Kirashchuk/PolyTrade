@@ -1,5 +1,5 @@
 import { bpsBetween, D, wire, type Dec } from './decimal.ts';
-import type { Instrument } from './instruments.ts';
+import { floorQty, type Instrument } from './instruments.ts';
 import { errorText, type Logger } from './log.ts';
 import type { SlotKey, TargetLadder, TargetQuote } from './quoteEngine.ts';
 import type { WriteOutcome } from './rest.ts';
@@ -30,7 +30,11 @@ export function planActions(ladder: TargetLadder | null, state: StateStore, inst
     if (!resting) { if (options.allowNew) plan.places.push({ slot, coid: newClientOrderId(), target }); continue; }
     if (resting.replace) { plan.cancels.push({ slot, coid: resting.coid, reason: 'replace' }); continue; }
     if (!options.allowNew) continue;
-    if (needsModify(resting, target, ladder!, instrument, options)) plan.modifies.push({ slot, coid: resting.coid, target, qtyTotal: resting.filled.plus(target.qty) });
+    if (!needsModify(resting, target, ladder!, instrument, options)) continue;
+    // The modify carries the total quantity; filled + target can exceed five significant digits, so round it down.
+    const qtyTotal = floorQty(instrument, resting.filled.plus(target.qty));
+    if (qtyTotal.lte(resting.filled)) plan.cancels.push({ slot, coid: resting.coid, reason: 'replace' });
+    else plan.modifies.push({ slot, coid: resting.coid, target, qtyTotal });
   }
   // Own orders resting outside their slot (a slot was re-placed before the old order surfaced) are always cancelled.
   for (const stray of state.strays()) if (!stray.inFlight) plan.cancels.push({ slot: null, coid: stray.coid, reason: 'stray' });
@@ -77,9 +81,10 @@ const GONE_ERRORS = new Set(['order_not_in_orderbook', 'order_already_terminal',
 /**
  * Sends one batch per operation type: cancels, then modifies, then places. Each signed batch gets exactly
  * one attempt. Any indeterminate outcome stops the cycle and requires a REST reconcile before more writes.
+ * Once `active()` turns false (the instrument is stopping) no further modify or place batch is sent.
  */
 export class Executor {
-  constructor(private readonly port: WritePort, private readonly state: StateStore, private readonly instrument: Instrument, private readonly log: Logger) {}
+  constructor(private readonly port: WritePort, private readonly state: StateStore, private readonly instrument: Instrument, private readonly log: Logger, private readonly active: () => boolean = () => true) {}
 
   async execute(plan: Plan): Promise<ExecutionReport> {
     const report: ExecutionReport = { sent: 0, indeterminate: false, errors: [] };
@@ -88,7 +93,7 @@ export class Executor {
       for (const coid of coids) { const o = this.state.orders.get(coid); if (o) { o.inFlight = true; this.state.touch(coid); } }
       const outcome = await this.port.write({ type: 'cancelOrdersCOID', args: coids });
       report.sent++;
-      if (!this.settle(outcome, coids, report, (coid, result) => {
+      if (!this.settle('cancel', outcome, coids, report, (coid, result) => {
         const order = this.state.orders.get(coid);
         if (!order) return;
         order.inFlight = false;
@@ -97,12 +102,12 @@ export class Executor {
         else report.errors.push(`cancel ${coid}: ${result.error}`);
       })) return report;
     }
-    if (plan.modifies.length) {
+    if (plan.modifies.length && this.active()) {
       const args: ModifyArgs[] = plan.modifies.map((m) => ({ coid: m.coid, p: wire(m.target.price), qty: wire(m.qtyTotal) }));
       for (const m of plan.modifies) { const o = this.state.orders.get(m.coid); if (o) { o.inFlight = true; this.state.touch(m.coid); } }
       const outcome = await this.port.write({ type: 'modifyOrdersCOID', args });
       report.sent++;
-      if (!this.settle(outcome, args.map((a) => a.coid), report, (coid, result) => {
+      if (!this.settle('modify', outcome, args.map((a) => a.coid), report, (coid, result) => {
         const order = this.state.orders.get(coid);
         if (!order) return;
         order.inFlight = false;
@@ -113,12 +118,12 @@ export class Executor {
         else if (error !== 'modify_would_cross' && error !== 'modify_no_op' && error !== 'order_in_flight' && error !== 'modify_already_pending') report.errors.push(`modify ${coid}: ${error}`);
       })) return report;
     }
-    if (plan.places.length) {
+    if (plan.places.length && this.active()) {
       const args: CreateOrderArgs[] = plan.places.map((p) => ({ iid: this.instrument.id, buy: p.target.side === 'bid', p: wire(p.target.price), qty: wire(p.target.qty), tif: 'gtc', po: true, c: p.coid }));
       for (const p of plan.places) this.state.registerPlacement(p.slot, p.coid, p.target.side, p.target.price, p.target.qty);
       const outcome = await this.port.write({ type: 'createOrders', args });
       report.sent++;
-      this.settle(outcome, args.map((a) => a.c), report, (coid, result) => {
+      const settled = this.settle('place', outcome, args.map((a) => a.c), report, (coid, result) => {
         const order = this.state.orders.get(coid);
         if (!order) return;
         order.inFlight = false;
@@ -128,6 +133,8 @@ export class Executor {
           if (order.status === 'submitting') { order.status = 'accepted'; order.rest = order.qty; }
         } else { order.status = `rejected:${result.error}`; this.state.release(coid); report.errors.push(`place ${coid}: ${result.error}`); }
       });
+      // Unknown outcome: the orders may still be created, so their slots stay reserved until the exchange says.
+      if (!settled) for (const coid of args.map((a) => a.c)) this.state.markUnconfirmed(coid);
     }
     return report;
   }
@@ -136,7 +143,7 @@ export class Executor {
    * Map a batch outcome onto its items. Returns false when the cycle must stop.
    * Indeterminate: items stay in flight until the REST reconcile resolves them.
    */
-  private settle(outcome: WriteOutcome, coids: string[], report: ExecutionReport, apply: (coid: string, result: ItemResult) => void): boolean {
+  private settle(kind: BatchKind, outcome: WriteOutcome, coids: string[], report: ExecutionReport, apply: (coid: string, result: ItemResult) => void): boolean {
     if (outcome.kind === 'indeterminate') {
       report.indeterminate = true;
       this.state.markResync(`indeterminate write: ${outcome.error}`);
@@ -159,6 +166,12 @@ export class Executor {
       report.indeterminate = true; this.state.markResync('acknowledgement count mismatch');
       return false;
     }
+    const malformed = results.findIndex((result, index) => !validItem(kind, result, coids[index]!));
+    if (malformed >= 0) {
+      report.indeterminate = true; this.state.markResync('malformed acknowledgement item');
+      this.log.error('malformed acknowledgement; outcome unknown until reconcile', { kind, index: malformed, item: JSON.stringify(results[malformed]).slice(0, 200) });
+      return false;
+    }
     results.forEach((result, index) => {
       try { apply(coids[index]!, result); } catch (error) { report.errors.push(errorText(error)); }
     });
@@ -167,3 +180,19 @@ export class Executor {
 }
 
 export interface ItemResult { status: 'ok' | 'err'; oid?: number; coid?: string; error?: string; order?: unknown; }
+type BatchKind = 'cancel' | 'modify' | 'place';
+
+/** An item counts only in the documented shape for its position; anything else leaves the outcome unknown. */
+function validItem(kind: BatchKind, value: unknown, coid: string): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  if (item.coid !== undefined && item.coid !== coid) return false;
+  if (item.status === 'err') return typeof item.error === 'string' && item.error.length > 0;
+  if (item.status !== 'ok') return false;
+  if (kind === 'place') return typeof item.oid === 'number';
+  if (kind === 'modify') {
+    const order = item.order;
+    return !!order && typeof order === 'object' && !Array.isArray(order) && ((order as { coid?: unknown }).coid === undefined || (order as { coid?: unknown }).coid === coid);
+  }
+  return true;
+}

@@ -58,7 +58,7 @@ Proxy credentials live only in the gitignored `quoter/.env`. Logs mask proxy use
 
 ## Automated checks
 
-`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **74 tests, 0 failures** (three consecutive runs).
+`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **88 tests, 0 failures**.
 
 | Behavior | Evidence |
 |---|---|
@@ -100,6 +100,26 @@ The quoter now quotes any set of listed instruments from one process (`instrumen
 
 Dashboard checks in the in-app browser during a dry-run (PLTR-USD + NVDA-USD): asset tabs with status, uptime and score; adding TSLA-USD from the exchange catalog (89 instruments) started it within about 6 s and saved the selection; removing it restored two tabs. The catalog no longer redraws on every poll, so a click cannot be lost, and the hidden add panel now stays hidden. At 375 px the page did not overflow. Endpoint tests cover the token, JSON, confirmation and symbol checks for add/remove, and a refused add returns 409 with a redacted reason.
 
+## Second review fixes — 20 October 2026
+
+`docs/code-review-2026-10-20-8ab9520.md` (13 findings on `8ab9520`) was re-checked against `3ed5056`, which had already rewritten the lifecycle for several instruments. Twelve findings still reproduced; for finding 9 only the instrument-list dependency remained. Each fix has a regression test in `quoter/test/review20261020.test.ts` or `liveMock.test.ts`. Eleven of the twelve unit tests and both new mock tests fail on the code before the fixes; the remaining one depends on a helper that did not exist before.
+
+- **Stop during startup (1).** The hub and each instrument check for Stop after every startup step. A Stop that arrives mid-startup ends it: no auto-cancel arm, private stream, timers or orders follow (mock test with a delayed `/v1/account/config`).
+- **Stop during a cycle (2).** Once an instrument is stopping, the executor sends no further modify or place batch, and the instrument refuses every write except cancels. Shutdown waits for the one write in flight (egress timeout + 5 s), then cancels.
+- **Unknown create outcome (3).** A create with a transport failure or malformed acknowledgement keeps its slot reserved. It is released only when the exchange reports the client id (stream, open orders or `GET /v1/account/orders?client_order_id=`), or after 330 s, when the 5-minute signature can no longer execute. Other slots keep quoting. While such a create is pending, a verified stop is not claimed, so the auto-cancel deadline stays armed.
+- **Acknowledgement items (4).** Each item must have the documented shape for its position: `ok` with `oid` for creates, `ok` with `order` for modifies, `err` with an error string, and any echoed `coid` must match. Otherwise the batch is treated as indeterminate.
+- **Book freshness (5).** A book is stale when its exchange event time (`ets`; `ts` for BBO) is older than `stale_book_ms` on the synced clock, even if it arrived just now. `ets = 0` falls back to the local receive time. The dashboard age includes the exchange lag.
+- **Portfolio ordering (6).** Positions and margin each keep the exchange `timestamp` of the data applied. Older data, such as a slow REST reply, is ignored by both the instrument state and the account store.
+- **Order updates (7).** An order update older than the last applied one (`uts` / `updated_timestamp`) is ignored, so a late modify acknowledgement cannot undo a fill.
+- **Modify quantity (8).** `filled + target` is rounded down onto the quantity grid (5 significant digits). If that would not exceed `filled`, the order is replaced instead.
+- **cancel-all (9).** The instrument list is not needed for `--instrument <numeric id>`. The command now fails unless the cancel is acknowledged and no open order remains.
+- **Leverage (10).** Only a `status: "ok"` response reporting the requested leverage confirms the update. Anything else stops that instrument's startup.
+- **Dead man's switch (11).** Disarm, and the shutdown decision to disarm, wait for any re-arm still in flight.
+- **Config (12).** Unknown keys are rejected in every nested section (`risk.max_daily_losss_usd` is an error).
+- **Dry-run depth (13).** Simulated quotes are no longer subtracted from the exchange book when measuring competing depth.
+
+A read-only dry-run on real public data (PLTR-USD and TSLA-USD over two proxies, separate port and metrics directory) reached live books within 2 s. Over 30 one-second samples each book stayed `live`, with a book age including exchange lag of 133–305 ms (limit 2,000 ms). Simulated uptime was 1.0. The run stopped cleanly through its dashboard endpoint with no error lines.
+
 ## Limitations
 
 - The live path is verified only against the mock exchange. Real acceptance of signatures, modify semantics, private `sq` numbering, `orders` event fields and margin reservation for opposite resting orders remain unverified until the account owner runs `status` and a $1k-per-level live session (spec §15, stage 6).
@@ -107,3 +127,5 @@ Dashboard checks in the in-app browser during a dry-run (PLTR-USD + NVDA-USD): a
 - Private sequence gaps trigger a REST reconcile. If gaps are routine, detection is disabled for that connection and the 30 s periodic reconcile remains.
 - Equity session profiles follow the NYSE weekly schedule without holidays.
 - Pause/stop use `cancelAll` on the quoted instrument, and `autoCancel` is account-wide, so manual orders on the account can be affected.
+- A create whose outcome stays unknown keeps its slot empty for up to 330 s if the exchange never reports the client id; order history may not list post-only rejections. During that time, removing the instrument or stopping reports an unverified cancel and leaves the auto-cancel deadline armed.
+- The `cancel-all` CLI path has no automated test (the module runs on import); its changes are covered only by typecheck.

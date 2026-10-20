@@ -7,7 +7,7 @@ import { EgressPool, parseEgressList } from './egress.ts';
 import { loadEnv } from './env.ts';
 import { findInstrument, type Instrument } from './instruments.ts';
 import { createLogger, errorText, type Level, type Logger } from './log.ts';
-import { Clock, REST_BASE, RestClient, WS_URL } from './rest.ts';
+import { acknowledged, Clock, REST_BASE, RestClient, WS_URL } from './rest.ts';
 import { signOperation } from './signer.ts';
 import { ManagedSocket } from './socket.ts';
 import { startDashboard, type DashboardHandle } from './dashboard/server.ts';
@@ -24,7 +24,7 @@ const USAGE = `Polymarket Perps liquidity quoter
 Options:
   --config <path>        default config/quoter.yaml, falling back to config/example.yaml
   --from-config          ignore the instrument selection saved from the dashboard (data/selection.json)
-  --instrument <symbol>  limit status / cancel-all to one instrument`;
+  --instrument <symbol>  limit status / cancel-all to one instrument (cancel-all also takes a numeric id)`;
 
 interface Context { env: Record<string, string | undefined>; settings: Settings; warnings: string[]; log: Logger; egress: EgressPool; rest: RestClient; clock: Clock; configPath: string; }
 
@@ -64,14 +64,20 @@ async function selectedSymbols(ctx: Context): Promise<{ symbols: string[]; sourc
   return { symbols: ctx.settings.instruments.map((i) => i.symbol), source: 'config' };
 }
 
-async function prepare(ctx: Context): Promise<Selection> {
-  const { log, settings, egress, rest, clock } = ctx;
+/** Egress route and server time: everything a signed request needs. */
+async function connect(ctx: Context): Promise<void> {
+  const { log, settings, egress, clock } = ctx;
   for (const warning of ctx.warnings) log.warn('config', { warning });
   const probe = await egress.probe(REST_BASE, settings.egress.select === 'fastest');
   log.info('egress probe', { routes: probe, selected: egress.describe() });
   if (!probe.some((route) => route.ok)) throw new Error('No egress route reaches the Perps API');
   const sync = await clock.sync();
   log.info('clock', sync);
+}
+
+async function prepare(ctx: Context): Promise<Selection> {
+  const { log, settings, rest, clock } = ctx;
+  await connect(ctx);
   const rows = await rest.getPublic<unknown[]>('/v1/info/instruments');
   const { symbols, source } = await selectedSymbols(ctx);
   const only = argument('--instrument');
@@ -144,17 +150,26 @@ async function statusCommand(ctx: Context): Promise<number> {
   return 0;
 }
 
+/**
+ * Emergency cancel: none of the new-quote checks apply (close-only, settled or unquotable instruments are cancelled too).
+ * `--instrument <id>` cancels by instrument id without needing the instrument list.
+ */
 async function cancelAllCommand(ctx: Context): Promise<number> {
-  const { instruments } = await prepare(ctx);
+  const only = argument('--instrument');
+  let targets: { id: number; symbol: string }[];
+  if (only && /^\d+$/.test(only.trim())) { await connect(ctx); targets = [{ id: Number(only.trim()), symbol: only.trim() }]; }
+  else targets = (await prepare(ctx)).instruments;
   const credentials = await credentialsFor(ctx);
   let failures = 0;
-  for (const instrument of instruments) {
+  for (const instrument of targets) {
     const request = await signOperation({ type: 'cancelAll', args: { iid: instrument.id } }, credentials.signer, ctx.clock.nowMs());
     const outcome = await ctx.rest.write(request);
     ctx.log.info('cancelAll', { instrument: instrument.symbol, ...outcome });
-    const open = await ctx.rest.getPrivate<unknown[]>('/v1/account/open-orders', credentials.auth, { instrument_id: instrument.id });
-    ctx.log.info('open orders after cancelAll', { instrument: instrument.symbol, count: Array.isArray(open) ? open.length : null });
-    if (outcome.kind !== 'ok') failures++;
+    await Bun.sleep(500);
+    const open = await ctx.rest.getPrivate<unknown[]>('/v1/account/open-orders', credentials.auth, { instrument_id: instrument.id }).catch((error) => { ctx.log.error('open orders unreadable after cancelAll', { instrument: instrument.symbol, error: errorText(error) }); return null; });
+    const remaining = Array.isArray(open) ? open.length : null;
+    ctx.log.info('open orders after cancelAll', { instrument: instrument.symbol, count: remaining });
+    if (!acknowledged(outcome) || remaining !== 0) failures++;
   }
   return failures ? 1 : 0;
 }

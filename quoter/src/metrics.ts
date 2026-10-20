@@ -48,7 +48,8 @@ export class Metrics {
     const score = snapshotScore(own.bid, own.ask);
     if (score > 0) { this.acc.qualifying++; this.acc.scoreSum += score; }
     add(this.acc.bid, own.bid); add(this.acc.ask, own.ask);
-    const ownAt = new Map(quotes.map((q) => [`${q.side}:${q.price.toFixed()}`, q.rest]));
+    // Dry-run quotes are simulated and not in the exchange book, so nothing is subtracted for them.
+    const ownAt = new Map(this.options.mode === 'live' ? quotes.map((q) => [`${q.side}:${q.price.toFixed()}`, q.rest]) : []);
     const depth = (levels: readonly Level[], side: 'bid' | 'ask'): BandNotional => {
       const out = zero();
       for (const [price, quantity] of levels) {

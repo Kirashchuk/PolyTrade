@@ -25,6 +25,9 @@ const exchange = {
   books: { 20: { bid: '180.10', ask: '180.12' } } as Record<number, { bid: string; ask: string }>,
   orders: new Map<string, MockOrder>(), writes: [] as { type: string; args: unknown; sigOk: boolean }[],
   autoCancel: 0, sockets: new Set<ServerWebSocket<{ authed: boolean; channels: Set<string> }>>(),
+  /** Per-route response delay (ms), e.g. 'GET /v1/account/config'. */
+  delays: {} as Record<string, number>,
+  leverage: 5, leverageReply: null as unknown,
 };
 const push = (channel: string, data: unknown) => {
   for (const ws of exchange.sockets) if (ws.data.channels.has(channel)) ws.send(JSON.stringify({ ch: channel, ts: Date.now(), sq: channel.startsWith('book') ? ++exchange.sq : ++exchange.privateSq, data }));
@@ -44,6 +47,7 @@ const server = Bun.serve<{ authed: boolean; channels: Set<string> }>({
     const url = new URL(request.url);
     if (url.pathname === '/v1/ws') return srv.upgrade(request, { data: { authed: false, channels: new Set() } }) ? undefined : new Response('no', { status: 400 });
     const key = `${request.method} ${url.pathname}`;
+    if (exchange.delays[key]) await Bun.sleep(exchange.delays[key]);
     if (url.pathname.startsWith('/v1/account/') && request.headers.get('polymarket-proxy') !== signer.address) return json({ status: 'err', error: 'unauthorized' }, 401);
     switch (key) {
       case 'GET /v1/info/time': return json({ time: Date.now() });
@@ -52,7 +56,7 @@ const server = Bun.serve<{ authed: boolean; channels: Set<string> }>({
       case 'GET /v1/info/book': { const id = Number(url.searchParams.get('instrument_id')), b = bookOf(id); return json({ instrument_id: id, bids: [[b.bid, '10']], asks: [[b.ask, '10']], timestamp: Date.now(), sequence: exchange.sq }); }
       case 'GET /v1/account/limits': return json({ actions_per_minute: 0, actions_per_minute_limit: 5000, open_orders: 0, open_orders_limit: 1000 });
       case 'GET /v1/account/auto-cancel': return json({ deadline: exchange.autoCancel, triggered: 0, daily_limit: 10, next_reset: 0 });
-      case 'GET /v1/account/config': return json([{ instrument_id: Number(url.searchParams.get('instrument_id')), leverage: 5, cross: true }]);
+      case 'GET /v1/account/config': return json([{ instrument_id: Number(url.searchParams.get('instrument_id')), leverage: exchange.leverage, cross: true }]);
       case 'GET /v1/account/portfolio': return json({ positions: [], margin: { total_account_value: '10000', available_order_margin: '9000' }, in_liquidation: false, timestamp: Date.now() });
       case 'GET /v1/account/stats': return json({ account_maker_share_7d: '0.012' });
       case 'GET /v1/account/rewards': return json({ data: [], more: false });
@@ -87,6 +91,7 @@ const server = Bun.serve<{ authed: boolean; channels: Set<string> }>({
         for (const o of exchange.orders.values()) if (o.status === 'open' && (op.args.iid === undefined || o.iid === op.args.iid)) { o.status = 'cancelled'; o.rest = '0'; setTimeout(() => orderEvent(o), 5); }
         return json({ status: 'ok' });
       case 'autoCancel': exchange.autoCancel = op.args.time; return json({ status: 'ok', deadline: op.args.time });
+      case 'updateLeverage': return json(exchange.leverageReply ?? { status: 'ok', instrument_id: op.args.iid, leverage: op.args.lev, cross: op.args.cross });
       default: return json({ status: 'err', error: 'unsupported' }, 400);
     }
   },
@@ -213,6 +218,39 @@ describe('live path against a local mock exchange', () => {
     expect(exchange.writes).toHaveLength(0);              // no cancelAll, no autoCancel
     expect(exchange.orders.get(manual)!.status).toBe('open');
     expect(exchange.autoCancel).toBe(foreignDeadline);
+    await cleanup();
+  }, 30_000);
+
+  test('review #1: Stop during startup ends it; nothing is armed or placed after Stop returns', async () => {
+    exchange.orders.clear(); exchange.writes.length = 0; exchange.autoCancel = 0;
+    exchange.delays['GET /v1/account/config'] = 600; // startup is inside ensureLeverage when Stop arrives
+    const { bot, cleanup } = await liveBot([PLTR_ROW]);
+    const starting = bot.start().then(() => 'started', (error: Error) => error.message);
+    await Bun.sleep(300);
+    await bot.stop('SIGINT');
+    const writesAtStop = exchange.writes.length;
+    expect(await starting).toContain('stopped during startup');
+    await Bun.sleep(1_200);
+    delete exchange.delays['GET /v1/account/config'];
+    expect(exchange.writes.length).toBe(writesAtStop);
+    expect(exchange.writes.some((w) => w.type === 'createOrders' || w.type === 'autoCancel')).toBe(false);
+    expect(openOn(45)).toHaveLength(0);
+    expect(exchange.autoCancel).toBe(0);
+    expect(await bot.done).toBe('SIGINT');
+    expect(bot.dashboardState().status).toBe('stopped');
+    await cleanup();
+  }, 30_000);
+
+  test('review #10: an HTTP 200 leverage reply without status ok is not a confirmed leverage', async () => {
+    exchange.orders.clear(); exchange.writes.length = 0; exchange.autoCancel = 0;
+    exchange.leverage = 3; exchange.leverageReply = { status: 'err', instrument_id: 45, error: 'invalid_leverage' };
+    const { bot, cleanup } = await liveBot([PLTR_ROW]);
+    await expect(bot.start()).rejects.toThrow('Leverage update not confirmed');
+    await bot.stop('startup failure');
+    exchange.leverage = 5; exchange.leverageReply = null;
+    expect(exchange.writes.some((w) => w.type === 'updateLeverage')).toBe(true);
+    expect(exchange.writes.some((w) => w.type === 'createOrders' || w.type === 'autoCancel')).toBe(false);
+    expect(bot.dashboardState().failed[0]?.reason).toContain('invalid_leverage');
     await cleanup();
   }, 30_000);
 });

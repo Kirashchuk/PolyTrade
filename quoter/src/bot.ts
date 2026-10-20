@@ -58,6 +58,7 @@ export class QuoterBot {
   private statusReason = '';
   private readonly startedAt: number;
   private stopping: Promise<void> | null = null;
+  private stopReason = '';
   private readonly now: () => number;
   private readonly ctx: QuoterContext;
   done: Promise<string>;
@@ -109,14 +110,19 @@ export class QuoterBot {
   }
 
   // ---------- lifecycle ----------
+  /** Startup checkpoint: after Stop, startup sends nothing more and starts no stream, timer or instrument. */
+  private alive(): void { if (this.stopping) throw new Error(`stopped during startup (${this.stopReason})`); }
+
   async start(): Promise<void> {
     const { settings, log, rest } = this.o;
     await this.refreshExchange();
+    this.alive();
     if (this.mode === 'live') {
       if (this.exchangeCancelOnly) throw new Error('Exchange is in cancel-only mode; not starting');
       const limits = await rest.getPrivate<{ actions_per_minute_limit: number; open_orders_limit: number }>('/v1/account/limits', this.auth());
       this.bucket.setRate(limits.actions_per_minute_limit * settings.budget.actionShare);
       const autoCancel = await this.readAutoCancel();
+      this.alive();
       log.info('account limits', { actionsPerMinute: limits.actions_per_minute_limit, openOrders: limits.open_orders_limit, autoCancelDailyLimit: autoCancel.dailyLimit, autoCancelTriggered: autoCancel.triggered });
       if (autoCancel.dailyLimit > 0 && autoCancel.triggered >= autoCancel.dailyLimit) throw new Error('Auto-cancel daily trigger limit is exhausted; the dead man\'s switch could not protect orders');
       this.privateStream = new PrivateStream(this.o.egress, this.auth(), {
@@ -127,16 +133,19 @@ export class QuoterBot {
       }, log.child('private'), this.o.wsUrl, this.now);
       this.privateStream.start();
       this.account.restoreAnchor(await this.loadAnchor());
+      this.alive();
     }
     this.feed.start();
     this.running = true;
     this.status = 'running';
     // Instruments take ownership of their books first. Until the dead man's switch is confirmed their risk check
     // keeps them paused, so no order can rest unprotected; a refused startup never touches the account-wide timer.
-    for (const instrument of this.o.instruments) await this.launch(instrument).catch(() => undefined);
+    for (const instrument of this.o.instruments) { this.alive(); await this.launch(instrument).catch(() => undefined); }
+    this.alive();
     if (!this.quoters.size) throw new Error(`No instrument could start: ${this.failed.map((f) => `${f.symbol}: ${f.reason}`).join('; ')}`);
     if (this.mode === 'live') {
       await this.deadman!.arm();
+      this.alive(); // a Stop during the arm disarms it (shutdown waits for the arm to settle)
       this.deadman!.start();
       log.info('dead man\'s switch armed', { deadline: new Date(this.deadman!.deadline()).toISOString() });
     }
@@ -166,8 +175,9 @@ export class QuoterBot {
       return quoter;
     } catch (error) {
       const reason = errorText(error);
-      this.o.log.error('instrument failed to start', { instrument: instrument.symbol, reason });
       await quoter.stop(`start failed: ${reason}`).catch(() => undefined);
+      if (this.stopping) throw new Error(reason); // the process is stopping: the shutdown owns this quoter
+      this.o.log.error('instrument failed to start', { instrument: instrument.symbol, reason });
       this.quoters.delete(instrument.id);
       this.dropFailure(instrument.symbol);
       this.failed.unshift({ symbol: instrument.symbol, reason, at: this.now() });
@@ -205,6 +215,7 @@ export class QuoterBot {
   }
 
   stop(reason: string): Promise<void> {
+    if (!this.stopping) this.stopReason = reason;
     this.stopping ??= this.shutdown(reason);
     return this.stopping;
   }
@@ -218,6 +229,8 @@ export class QuoterBot {
     this.deadman?.stop();
     const results = await Promise.all([...this.quoters.values()].map((q) => q.stop(reason).catch(() => false)));
     if (this.mode === 'live') {
+      // A re-arm already in flight must settle first, so it cannot land after the disarm and re-enable the timer.
+      await this.deadman?.settled();
       // Only clear a schedule this process armed, and only once every instrument's orders are verified gone.
       if (this.deadman?.armed() && results.every(Boolean)) await this.deadman.disarm().catch((error) => log.warn('disarm failed', { error: errorText(error) }));
       await this.saveAnchor();

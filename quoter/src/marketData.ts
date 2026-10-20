@@ -43,7 +43,11 @@ export class MarketBook {
   private readonly history: { t: number; mid: Dec }[] = [];
   private readonly now: () => number;
 
-  constructor(readonly instrumentId: number, private readonly options: { staleMs: number; onUpdate?: (state: MarketState) => void; now?: () => number }) {
+  /**
+   * `exchangeNow` is server time (the synced clock). With it, a book whose exchange timestamp is older than `staleMs`
+   * is stale however recently it arrived (a lagging feed or proxy delivers old data on time).
+   */
+  constructor(readonly instrumentId: number, private readonly options: { staleMs: number; onUpdate?: (state: MarketState) => void; now?: () => number; exchangeNow?: () => number }) {
     this.now = options.now ?? Date.now;
   }
 
@@ -63,7 +67,8 @@ export class MarketBook {
       const data = frame.data as { b?: unknown; a?: unknown } | undefined;
       const bids = levels(data?.b, true), asks = levels(data?.a, false);
       if (!bids || !asks) return;
-      this.apply(bids, asks, frame.ets ?? frame.ts ?? null, frame.sq ?? null, `${WS_URL} book::${this.instrumentId}`);
+      // `ets` is the event horizon; 0 means none is attested, so the age is then unknown (local receive time only).
+      this.apply(bids, asks, frame.ets === undefined ? frame.ts ?? null : frame.ets || null, frame.sq ?? null, `${WS_URL} book::${this.instrumentId}`);
     } else if (frame.ch === `bbo::${this.instrumentId}`) {
       const data = frame.data as { bp?: unknown; bq?: unknown; ap?: unknown; aq?: unknown } | undefined;
       const bid = levels([[data?.bp, data?.bq]], true), ask = levels([[data?.ap, data?.aq]], false);
@@ -92,7 +97,8 @@ export class MarketBook {
 
   snapshot(): MarketState {
     const t = this.now();
-    const age = this.receivedAt === null ? Infinity : t - this.receivedAt;
+    const exchangeAge = this.exchangeTs && this.options.exchangeNow ? this.options.exchangeNow() - this.exchangeTs : 0;
+    const age = this.receivedAt === null ? Infinity : Math.max(t - this.receivedAt, exchangeAge);
     const complete = this.bestBid !== null && this.bestAsk !== null;
     const status: DataStatus = !complete || this.receivedAt === null ? 'unavailable' : age > this.options.staleMs ? 'stale' : 'live';
     return {

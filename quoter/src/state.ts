@@ -15,6 +15,13 @@ export interface OwnOrder {
   inFlight: boolean;
   /** Next action for the slot must be cancel + place (e.g. modify limit reached). */
   replace: boolean;
+  /** Exchange update time (`uts`) of the newest order state applied; older reports are ignored. */
+  uts: number | null;
+  /**
+   * Set when the create outcome is unknown (transport failure, malformed acknowledgement). Until the exchange reports
+   * the order or its signature can no longer execute, the slot stays reserved and no replacement is placed.
+   */
+  unconfirmedUntil: number | null;
 }
 export interface ForeignOrder { oid: number; coid: string | null; side: Side; price: string; rest: string; }
 /** Missing fee or PnL stays null, never 0. */
@@ -27,6 +34,8 @@ export interface AccountSnapshot {
 type Row = Record<string, unknown>;
 const row = (value: unknown): Row => value && typeof value === 'object' && !Array.isArray(value) ? value as Row : {};
 const money = (value: unknown): number | null => typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : null;
+/** A signed operation expires 5 minutes after its `ts`; a margin covers clock offset and transit. */
+export const UNCONFIRMED_HOLD_MS = 330_000;
 
 /**
  * Single source of truth for the bot's own orders, position and margin (spec §7).
@@ -40,6 +49,9 @@ export class StateStore {
   private readonly seenFills = new Set<number>();
   private portfolioQty = new D(0);
   private account: Omit<AccountSnapshot, 'positionQty'> = { entryPrice: null, unrealizedPnl: null, availableMargin: null, accountValue: null, inLiquidation: false, portfolioAt: null };
+  /** Exchange timestamps of the newest applied portfolio data: a slower, older snapshot never replaces it. */
+  private positionsTs: number | null = null;
+  private marginTs: number | null = null;
   private resyncReason: string | null = 'initial snapshot';
   readonly postOnlyRejects = new Map<SlotKey, number>();
 
@@ -47,11 +59,14 @@ export class StateStore {
 
   // ---------- intents ----------
   registerPlacement(slot: SlotKey, coid: string, side: Side, price: Dec, qty: Dec): void {
-    this.orders.set(coid, { coid, oid: null, slot, side, price, qty, filled: new D(0), rest: new D(0), status: 'submitting', updatedAt: this.now(), inFlight: true, replace: false });
+    this.orders.set(coid, { coid, oid: null, slot, side, price, qty, filled: new D(0), rest: new D(0), status: 'submitting', updatedAt: this.now(), inFlight: true, replace: false, uts: null, unconfirmedUntil: null });
     this.slots.set(slot, coid);
   }
   /** A local write touched the order: snapshots requested before now cannot judge it. */
   touch(coid: string): void { const order = this.orders.get(coid); if (order) order.updatedAt = this.now(); }
+  /** The create outcome is unknown: keep the slot until the exchange reports the order or it can no longer execute. */
+  markUnconfirmed(coid: string): void { const order = this.orders.get(coid); if (order && order.status === 'submitting') order.unconfirmedUntil = this.now() + UNCONFIRMED_HOLD_MS; }
+  unconfirmed(): OwnOrder[] { return [...this.orders.values()].filter((o) => o.unconfirmedUntil !== null); }
   /** The order left the slot (terminal or abandoned). */
   release(coid: string): void {
     const order = this.orders.get(coid);
@@ -76,6 +91,8 @@ export class StateStore {
       : typeof oid === 'number' ? [...this.orders.values()].find((o) => o.oid === oid)?.coid ?? null : null;
     const order = coid ? this.orders.get(coid) : undefined;
     if (!order) return null;
+    const uts = typeof r.uts === 'number' ? r.uts : typeof r.updated_timestamp === 'number' ? r.updated_timestamp : null;
+    if (uts !== null && order.uts !== null && uts < order.uts) return order; // e.g. a late modify ack after a newer fill event
     const status = String(r.status ?? order.status);
     const price = r.p ?? r.price, qty = r.qty ?? r.quantity, fill = r.fill ?? r.filled_quantity, rest = r.rest ?? r.resting_quantity;
     if (typeof price === 'string') order.price = exact(price, 'order price');
@@ -83,9 +100,11 @@ export class StateStore {
     if (typeof fill === 'string') order.filled = exact(fill, 'order fill');
     if (typeof rest === 'string') order.rest = exact(rest, 'order rest');
     if (typeof oid === 'number') order.oid = oid;
+    if (uts !== null) order.uts = uts;
     order.status = status;
     order.updatedAt = this.now();
     order.inFlight = false;
+    order.unconfirmedUntil = null; // the exchange knows the order: its creation is settled
     if (status === 'post_only_rejected') this.postOnlyRejects.set(order.slot, (this.postOnlyRejects.get(order.slot) ?? 0) + 1);
     else if (isActive(status)) this.postOnlyRejects.delete(order.slot);
     const resting = isActive(status) && (order.rest.gt(0) || status === 'accepted' || status === 'pending');
@@ -121,22 +140,30 @@ export class StateStore {
     return added;
   }
 
-  /** Portfolio snapshot or partial frame: only the fields present are applied; nothing is reset by omission. */
+  /**
+   * Portfolio snapshot or partial frame: only the fields present are applied; nothing is reset by omission.
+   * Data older (by exchange `timestamp`) than what is already applied is ignored, so a slow REST reply cannot
+   * roll back a newer stream frame.
+   */
   applyPortfolio(data: unknown): void {
     const r = row(data), margin = r.margin === undefined ? null : row(r.margin);
+    const at = typeof r.timestamp === 'number' ? r.timestamp : null;
+    const newer = (last: number | null) => at === null || last === null || at >= last;
     const next = { ...this.account };
-    if (Array.isArray(r.positions)) {
+    if (Array.isArray(r.positions) && newer(this.positionsTs)) {
+      if (at !== null) this.positionsTs = at;
       const mine = r.positions.map(row).find((p) => p.instrument_id === this.instrumentId || p.symbol === this.symbol);
       this.portfolioQty = mine ? exactSigned(mine.size, 'position size') : new D(0);
       next.entryPrice = mine && typeof mine.entry_price === 'string' ? mine.entry_price : null;
       next.unrealizedPnl = mine ? money(mine.unrealized_pnl) : 0;
       next.portfolioAt = typeof r.timestamp === 'number' ? r.timestamp : this.now();
     }
-    if (margin) {
-      if (margin.available_order_margin !== undefined) next.availableMargin = money(margin.available_order_margin);
-      if (margin.total_account_value !== undefined) next.accountValue = money(margin.total_account_value);
+    if ((margin || typeof r.in_liquidation === 'boolean') && newer(this.marginTs)) {
+      if (at !== null) this.marginTs = at;
+      if (margin?.available_order_margin !== undefined) next.availableMargin = money(margin.available_order_margin);
+      if (margin?.total_account_value !== undefined) next.accountValue = money(margin.total_account_value);
+      if (typeof r.in_liquidation === 'boolean') next.inLiquidation = r.in_liquidation;
     }
-    if (typeof r.in_liquidation === 'boolean') next.inLiquidation = r.in_liquidation;
     this.account = next;
   }
 
@@ -163,8 +190,10 @@ export class StateStore {
       if (seen.has(order.coid) || !isActive(order.status) && order.status !== 'submitting') continue;
       // Newer than the snapshot: stream data wins; only an unacknowledged write stays unresolved.
       if (order.updatedAt >= asOf) { if (order.inFlight || order.status === 'submitting') unresolved++; continue; }
-      if (order.status === 'submitting' && this.now() - order.updatedAt < graceMs) { unresolved++; continue; }
-      order.status = 'absent'; order.rest = new D(0); order.inFlight = false; this.release(order.coid);
+      // Absence from open orders does not prove an unconfirmed create will not execute: its slot stays reserved.
+      if (order.unconfirmedUntil !== null && this.now() < order.unconfirmedUntil) continue;
+      if (order.status === 'submitting' && order.unconfirmedUntil === null && this.now() - order.updatedAt < graceMs) { unresolved++; continue; }
+      order.status = 'absent'; order.rest = new D(0); order.inFlight = false; order.unconfirmedUntil = null; this.release(order.coid);
     }
     return unresolved;
   }
@@ -194,7 +223,8 @@ export class StateStore {
   liveCoids(): string[] { return [...this.slots.values()]; }
   /** Own orders that rest outside their slot (a duplicate of a re-placed slot): to be cancelled. */
   strays(): OwnOrder[] { return this.activeOrders().filter((o) => this.slots.get(o.slot) !== o.coid); }
-  ownLiveCount(): number { return this.liveCoids().length + this.strays().length; }
+  /** Own orders known to rest or be acknowledged; an unconfirmed create is not known to exist (see `unconfirmed`). */
+  ownLiveCount(): number { return this.liveCoids().filter((coid) => this.orders.get(coid)?.unconfirmedUntil === null).length + this.strays().length; }
 
   /** Drop finished orders older than `maxAgeMs`; resting and in-flight orders are always kept. */
   prune(maxAgeMs = 600_000): void {

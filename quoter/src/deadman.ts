@@ -18,11 +18,21 @@ export class Deadman {
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastDeadline = 0;
   private confirmedOnce = false;
+  /** Arms whose outcome is not known yet; disarm waits for them so a late re-arm cannot land after it. */
+  private readonly inflight = new Set<Promise<number>>();
   failures = 0;
 
   constructor(private readonly port: DeadmanPort, private readonly options: { timeoutS: number; rearmEveryS: number }, private readonly log: Logger, private readonly alert: (message: string) => void) {}
 
   async arm(): Promise<number> {
+    const task = this.armOnce();
+    this.inflight.add(task);
+    try { return await task; } finally { this.inflight.delete(task); }
+  }
+  /** Resolves once no arm is in flight. */
+  async settled(): Promise<void> { await Promise.allSettled([...this.inflight]); }
+
+  private async armOnce(): Promise<number> {
     const deadline = this.port.nowMs() + this.options.timeoutS * 1_000;
     const outcome = await this.port.write({ type: 'autoCancel', args: { time: deadline } });
     if (acknowledged(outcome)) {
@@ -50,6 +60,7 @@ export class Deadman {
   /** Clear the schedule at a clean shutdown: triggers are limited per day. */
   async disarm(): Promise<void> {
     this.stop();
+    await this.settled();
     const outcome = await this.port.write({ type: 'autoCancel', args: { time: 0 } });
     if (!acknowledged(outcome)) this.log.warn('auto-cancel disarm not confirmed; the deadline will still fire', { kind: outcome.kind, error: outcome.kind === 'ok' ? 'no ok status in body' : outcome.error });
     else this.lastDeadline = 0;

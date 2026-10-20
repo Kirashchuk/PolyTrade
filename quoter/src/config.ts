@@ -35,9 +35,11 @@ export interface Settings {
 }
 
 type Obj = Record<string, unknown>;
-const obj = (value: unknown, path: string): Obj => {
+/** A mapping section; with `keys`, any other key is an error (a typo must not silently fall back to a default). */
+const obj = (value: unknown, path: string, keys?: string[]): Obj => {
   if (value === undefined || value === null) return {};
   if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path}: expected a mapping`);
+  if (keys) unknownKeys(value as Obj, keys, path);
   return value as Obj;
 };
 function num(o: Obj, key: string, path: string, fallback: number | undefined, min: number, max: number): number {
@@ -50,14 +52,14 @@ function str<T extends string>(o: Obj, key: string, path: string, fallback: T, a
   if (typeof value !== 'string' || (allowed && !allowed.includes(value as T))) throw new Error(`${path}.${key}: expected ${allowed ? allowed.join(' | ') : 'a string'}`);
   return value as T;
 }
+function unknownKeys(o: Obj, allowed: string[], path: string): void {
+  for (const key of Object.keys(o)) if (!allowed.includes(key)) throw new Error(`${path}: unknown key "${key}"`);
+}
 function bool(o: Obj, key: string, path: string, fallback: boolean): boolean {
   const value = o[key] ?? fallback;
   if (typeof value !== 'boolean') throw new Error(`${path}.${key}: expected true or false`);
   return value;
 }
-const unknownKeys = (o: Obj, allowed: string[], path: string) => {
-  for (const key of Object.keys(o)) if (!allowed.includes(key)) throw new Error(`${path}: unknown key "${key}"`);
-};
 
 export interface ConfigReport { settings: Settings; warnings: string[]; }
 
@@ -65,15 +67,22 @@ export function parseSettings(input: unknown): ConfigReport {
   const root = obj(input, 'config'), warnings: string[] = [];
   unknownKeys(root, ['instrument', 'instruments', 'mode', 'leverage', 'operator', 'egress', 'credentials', 'levels', 'requote', 'inventory', 'risk', 'deadman', 'sessions', 'budget', 'metrics', 'dashboard'], 'config');
 
-  const operator = obj(root.operator, 'operator'), egress = obj(root.egress, 'egress'), credentials = obj(root.credentials, 'credentials');
-  const requote = obj(root.requote, 'requote'), inventory = obj(root.inventory, 'inventory'), risk = obj(root.risk, 'risk');
-  const vol = obj(risk.vol_breaker, 'risk.vol_breaker'), widen = obj(risk.post_only_reject_widen, 'risk.post_only_reject_widen');
-  const deadman = obj(root.deadman, 'deadman'), sessions = obj(root.sessions, 'sessions'), budget = obj(root.budget, 'budget'), metrics = obj(root.metrics, 'metrics'), dashboard = obj(root.dashboard, 'dashboard');
+  const operator = obj(root.operator, 'operator', ['jurisdiction', 'region']);
+  const egress = obj(root.egress, 'egress', ['select', 'allow_direct', 'timeout_ms', 'public_feeds']);
+  const credentials = obj(root.credentials, 'credentials', ['proxy_ttl_hours']);
+  const requote = obj(root.requote, 'requote', ['threshold_bps', 'min_interval_ms', 'refill_ratio', 'min_edge_bps']);
+  const inventory = obj(root.inventory, 'inventory');
+  const risk = obj(root.risk, 'risk', ['stale_book_ms', 'vol_breaker', 'max_daily_loss_usd', 'min_available_margin_usd', 'post_only_reject_widen', 'startup_cancel_all', 'reconcile_every_s', 'max_freeze_s']);
+  const vol = obj(risk.vol_breaker, 'risk.vol_breaker', ['move_bps', 'window_s', 'pause_s', 'action', 'widen_bps']);
+  const widen = obj(risk.post_only_reject_widen, 'risk.post_only_reject_widen', ['after', 'ticks', 'for_s']);
+  const deadman = obj(root.deadman, 'deadman', ['timeout_s', 'rearm_every_s']);
+  const sessions = obj(root.sessions, 'sessions', ['schedule', 'regular', 'overnight', 'weekend']);
+  const budget = obj(root.budget, 'budget', ['action_share']), metrics = obj(root.metrics, 'metrics', ['dir', 'flush_s']), dashboard = obj(root.dashboard, 'dashboard', ['enabled', 'port']);
 
   const levels = parseLevels(root.levels, 'levels', warnings);
 
   const profile = (name: SessionName, fallback: SessionProfile): SessionProfile => {
-    const value = obj(sessions[name], `sessions.${name}`);
+    const value = obj(sessions[name], `sessions.${name}`, ['size_mult', 'bps_add']);
     return { sizeMult: num(value, 'size_mult', `sessions.${name}`, fallback.sizeMult, 0, 1), bpsAdd: num(value, 'bps_add', `sessions.${name}`, fallback.bpsAdd, 0, 15) };
   };
 

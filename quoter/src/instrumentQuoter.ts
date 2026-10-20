@@ -59,6 +59,12 @@ export class InstrumentQuoter {
   private lastPrinted = 0;
   /** Set once startup has checked (or cleared) this instrument's book; only then does stopping cancel on it. */
   private ownsBook = false;
+  private startTask: Promise<void> | null = null;
+  private stopTask: Promise<boolean> | null = null;
+  /** Set by the first stop: startup aborts at its next step and no new order or modify is sent. */
+  private stopRequested = false;
+  private stopVerified = false;
+  private lastConfirmCheck = 0;
   private halted: string | null = null;
   private ladder: TargetLadder | null = null;
   private readonly history: HistoryPoint[] = [];
@@ -72,13 +78,15 @@ export class InstrumentQuoter {
     this.log = ctx.log.child(instrument.symbol);
     this.startedAt = ctx.now();
     this.state = new StateStore(instrument.id, instrument.symbol, ctx.now);
-    this.book = new MarketBook(instrument.id, { staleMs: ctx.settings.risk.staleBookMs, onUpdate: () => this.requestCycle(), now: ctx.now });
+    this.book = new MarketBook(instrument.id, { staleMs: ctx.settings.risk.staleBookMs, onUpdate: () => this.requestCycle(), now: ctx.now, exchangeNow: () => ctx.clock.nowMs() });
     this.risk = new RiskManager(ctx.settings, (key, message) => this.log.warn('ALERT', { key, message, instrument: instrument.symbol }));
     this.metrics = new Metrics(instrument, { dir: ctx.settings.metrics.dir, flushS: ctx.settings.metrics.flushS, mode: ctx.mode }, this.log.child('metrics'), ctx.now);
-    this.executor = ctx.mode === 'live' ? new Executor({ write: (op) => this.write(op) }, this.state, instrument, this.log.child('executor')) : null;
+    this.executor = ctx.mode === 'live' ? new Executor({ write: (op) => this.write(op) }, this.state, instrument, this.log.child('executor'), () => !this.stopRequested) : null;
   }
 
   private async write(op: Operation): Promise<WriteOutcome> {
+    // Last line of defence: once stopping, only cancels reach the exchange.
+    if (this.stopRequested && op.type !== 'cancelAll' && op.type !== 'cancelOrdersCOID') throw new Error(`${this.instrument.symbol} is stopping; ${op.type} not sent`);
     this.lastWriteAt = this.ctx.now();
     return this.ctx.write(op);
   }
@@ -94,9 +102,18 @@ export class InstrumentQuoter {
 
   // ---------- lifecycle ----------
   /** Validates the instrument, takes ownership of its book (live), subscribes market data and starts quoting. */
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    this.startTask ??= this.boot();
+    return this.startTask;
+  }
+  /** Startup checkpoint: a stop requested meanwhile ends startup before its next exchange call. */
+  private alive(): void { if (this.stopRequested) throw new Error(`${this.instrument.symbol}: stopped during startup`); }
+
+  private async boot(): Promise<void> {
     const { settings, rest, log } = { ...this.ctx, log: this.log };
+    this.alive();
     const top = await rest.getPublic<{ bids: [string, string][]; asks: [string, string][] }>('/v1/info/book', { instrument_id: this.instrument.id, depth: 10 });
+    this.alive();
     const mid = top.bids[0] && top.asks[0] ? new D(top.bids[0][0]).plus(top.asks[0][0]).div(2) : null;
     const check = checkAgainstInstrument(this.profile, this.instrument, mid);
     for (const warning of check.warnings) log.warn('instrument check', { warning });
@@ -104,19 +121,24 @@ export class InstrumentQuoter {
 
     if (this.ctx.mode === 'live') {
       await this.reconcile('startup');
+      this.alive();
       if (this.state.foreign.length) {
         if (!settings.risk.startupCancelAll) throw new Error(`${this.state.foreign.length} open order(s) not owned by this process on ${this.instrument.symbol}; cancel them or set risk.startup_cancel_all`);
         this.ownsBook = true;
         await this.cancelAllAndVerify('startup');
+        this.alive();
       }
       // From here on this quoter owns the instrument's book: stopping cancels everything on it.
       this.ownsBook = true;
       await this.ensureLeverage();
+      this.alive();
     }
 
     await this.book.seedFromRest(rest).catch((error) => log.warn('REST book seed failed', { error: errorText(error) }));
+    this.alive();
     await this.ctx.feed.add(this.book);
-    await this.waitFor(() => this.ctx.feed.connected() && this.book.snapshot().status === 'live', 45_000, `first live order book for ${this.instrument.symbol}`);
+    await this.waitFor(() => this.stopRequested || (this.ctx.feed.connected() && this.book.snapshot().status === 'live'), 45_000, `first live order book for ${this.instrument.symbol}`);
+    this.alive();
     this.running = true;
     this.timers.push(setInterval(() => this.requestCycle(), 1_000));
     this.timers.push(setInterval(() => this.sampleMetrics(), 1_000));
@@ -126,15 +148,28 @@ export class InstrumentQuoter {
     this.requestCycle();
   }
 
-  /** Stops quoting; in live mode cancels this instrument's book. Returns whether the cancel was verified (or not needed). */
-  async stop(reason: string): Promise<boolean> {
+  /**
+   * Stops quoting; in live mode cancels this instrument's book. Returns whether the cancel was verified (or not needed).
+   * Concurrent calls share one run; after an unverified cancel a later call tries again.
+   */
+  stop(reason: string): Promise<boolean> {
+    this.stopTask ??= this.shutdown(reason).finally(() => { this.stopTask = null; });
+    return this.stopTask;
+  }
+
+  private async shutdown(reason: string): Promise<boolean> {
+    this.stopRequested = true;
+    if (this.stopVerified) return true;
     this.log.warn('instrument stopping', { reason });
     this.status = 'stopping'; this.statusReason = reason;
     this.running = false;
     for (const timer of this.timers) clearInterval(timer);
     this.timers.length = 0;
     if (this.cycleTimer) clearTimeout(this.cycleTimer);
-    await this.waitFor(() => !this.busy, 10_000, 'in-flight quote cycle').catch(() => undefined);
+    // Startup aborts at its next checkpoint; a running cycle sends no further batch after its current write.
+    await this.startTask?.catch(() => undefined);
+    await this.waitFor(() => !this.busy, this.ctx.settings.egress.timeoutMs + 5_000, 'in-flight quote cycle')
+      .catch((error) => this.log.error('quote cycle still writing; cancelling anyway', { error: errorText(error) }));
     let verified = true;
     if (this.ctx.mode === 'live' && this.ownsBook) {
       try { await this.cancelAllAndVerify(reason); } catch (error) { verified = false; this.log.error('cancel on stop not verified; auto-cancel deadline stays armed', { error: errorText(error) }); }
@@ -142,6 +177,7 @@ export class InstrumentQuoter {
     await this.ctx.feed.remove(this.instrument.id);
     await this.metrics.flush(true);
     this.status = 'stopped'; this.statusReason = reason;
+    this.stopVerified = verified;
     return verified;
   }
 
@@ -156,6 +192,9 @@ export class InstrumentQuoter {
       await this.reconcile(`after cancelAll (${reason}), second check`);
       if (this.state.ownLiveCount() || this.state.foreign.length) throw new Error('Open orders remain after cancelAll');
     }
+    // A create with an unknown outcome may still execute after the cancel; the auto-cancel deadline must stay armed.
+    const unconfirmed = this.state.unconfirmed().length;
+    if (unconfirmed) throw new Error(`${unconfirmed} order create(s) with unknown outcome may still execute`);
   }
 
   private async ensureLeverage(): Promise<void> {
@@ -166,7 +205,10 @@ export class InstrumentQuoter {
     if (current?.leverage === leverage) { this.log.info('leverage confirmed', { leverage, cross: current.cross }); return; }
     const outcome = await this.write({ type: 'updateLeverage', args: { iid: this.instrument.id, lev: leverage, cross: current?.cross ?? true } });
     if (outcome.kind !== 'ok') throw new Error(`Leverage update ${outcome.kind}: ${outcome.error}`);
-    this.log.info('leverage set', { leverage });
+    // The response is the effective configuration after the update; only that confirms the change.
+    const body = outcome.body as { leverage?: unknown; cross?: unknown } | null;
+    if (!acknowledged(outcome) || body?.leverage !== leverage) throw new Error(`Leverage update not confirmed: ${JSON.stringify(outcome.body).slice(0, 160)}`);
+    this.log.info('leverage set', { leverage, cross: body.cross });
   }
 
   // ---------- inputs from the hub ----------
@@ -187,9 +229,10 @@ export class InstrumentQuoter {
   private async maybeReconcile(): Promise<void> {
     const pending = this.state.needsResync();
     const periodic = this.ctx.now() - (this.lastReconcile ?? 0) > this.ctx.settings.risk.reconcileEveryS * 1_000;
-    if ((!pending && !periodic) || this.reconciling || this.busy) return;
+    const confirming = this.state.unconfirmed().length > 0 && this.ctx.now() - this.lastConfirmCheck > 5_000;
+    if ((!pending && !periodic && !confirming) || this.reconciling || this.busy) return;
     if (pending?.startsWith('indeterminate') && this.ctx.now() - this.lastWriteAt < 2_000) return; // let the exchange settle first
-    await this.reconcile(pending ?? 'periodic').catch((error) => this.log.warn('reconcile failed', { error: errorText(error) }));
+    await this.reconcile(pending ?? (confirming ? 'unconfirmed create' : 'periodic')).catch((error) => this.log.warn('reconcile failed', { error: errorText(error) }));
   }
 
   /**
@@ -215,12 +258,30 @@ export class InstrumentQuoter {
       const unresolved = this.state.applyOpenOrders(open, asOf);
       this.state.applyPortfolio(portfolio);
       this.ctx.applyAccountPortfolio(portfolio);
+      await this.confirmCreates(auth);
       if (unresolved) this.state.markResync(`${unresolved} submitted order(s) not yet visible`); else this.state.resynced(generation);
       this.lastReconcile = this.ctx.now();
       if (reason !== 'periodic') this.log.info('reconciled', { reason, ownLive: this.state.liveCoids().length, strays: this.state.strays().length, foreign: this.state.foreign.length, position: this.state.snapshot().positionQty.toFixed() });
     } finally {
       this.reconciling = false;
       if (this.running) this.requestCycle();
+    }
+  }
+
+  /**
+   * Creates with an unknown outcome that are not resting: the order history says whether they executed (filled,
+   * cancelled, rejected). Not found there, the slot stays reserved until the signature can no longer execute.
+   */
+  private async confirmCreates(auth: PrivateAuth): Promise<void> {
+    const pending = this.state.unconfirmed();
+    if (!pending.length) return;
+    this.lastConfirmCheck = this.ctx.now();
+    for (const order of pending.slice(0, 5)) {
+      try {
+        const rows = await this.ctx.rest.getPrivate<unknown[]>('/v1/account/orders', auth, { client_order_id: order.coid, instrument_id: this.instrument.id });
+        const match = Array.isArray(rows) ? rows.find((r) => (r as { client_order_id?: unknown } | null)?.client_order_id === order.coid) : undefined;
+        if (match) { this.state.applyOrder(match); this.log.info('unconfirmed create resolved', { coid: order.coid, status: order.status }); }
+      } catch (error) { this.log.warn('order history lookup failed', { coid: order.coid, error: errorText(error) }); }
     }
   }
 
@@ -368,7 +429,7 @@ export class InstrumentQuoter {
       market: {
         status: market.status, bid: market.bestBid?.toFixed() ?? null, ask: market.bestAsk?.toFixed() ?? null, mid: mid?.toFixed() ?? null,
         spreadBps: mid && market.bestBid && market.bestAsk ? bpsBetween(market.bestAsk, market.bestBid, mid) : null,
-        ageMs: market.receivedAt === null ? null : t - market.receivedAt, source: market.source,
+        ageMs: market.receivedAt === null ? null : Math.max(t - market.receivedAt, market.exchangeTs ? this.ctx.clock.nowMs() - market.exchangeTs : 0), source: market.source,
       },
       ladder: rows, skewBps: ladder?.skewBps ?? null,
       position: this.ctx.mode === 'live' ? { qty: position.positionQty.toFixed(), usd: mid ? position.positionQty.mul(mid).toNumber() : null, entryPrice: position.entryPrice, unrealizedPnl: position.unrealizedPnl } : null,

@@ -11,18 +11,27 @@ const money = (value: unknown): number | null => typeof value === 'string' && /^
 export class AccountStore {
   private view: AccountView = { availableMargin: null, accountValue: null, inLiquidation: false, portfolioAt: null };
   private equityAnchor: EquityAnchor | null = null;
+  /** Exchange timestamps of the newest applied data: an older snapshot (a slow REST reply) is ignored. */
+  private marginTs: number | null = null;
+  private positionsTs: number | null = null;
 
   constructor(private readonly now: () => number = Date.now) {}
 
   applyPortfolio(data: unknown): void {
     const r = row(data), next = { ...this.view };
-    if (r.margin !== undefined) {
+    const at = typeof r.timestamp === 'number' ? r.timestamp : null;
+    const newer = (last: number | null) => at === null || last === null || at >= last;
+    if ((r.margin !== undefined || typeof r.in_liquidation === 'boolean') && newer(this.marginTs)) {
+      if (at !== null) this.marginTs = at;
       const margin = row(r.margin);
       if (margin.available_order_margin !== undefined) next.availableMargin = money(margin.available_order_margin);
       if (margin.total_account_value !== undefined) next.accountValue = money(margin.total_account_value);
+      if (typeof r.in_liquidation === 'boolean') next.inLiquidation = r.in_liquidation;
     }
-    if (typeof r.in_liquidation === 'boolean') next.inLiquidation = r.in_liquidation;
-    if (Array.isArray(r.positions)) next.portfolioAt = typeof r.timestamp === 'number' ? r.timestamp : this.now();
+    if (Array.isArray(r.positions) && newer(this.positionsTs)) {
+      if (at !== null) this.positionsTs = at;
+      next.portfolioAt = at ?? this.now();
+    }
     this.view = next;
   }
 
