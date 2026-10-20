@@ -84,3 +84,11 @@ describe('QuoteEngine', () => {
     expect(find(widened, 'bid:2')!.price.eq(find(base, 'bid:2')!.price)).toBe(true);
   });
 });
+
+describe('QuoteEngine across a price decade', () => {
+  test('tick moves near 1000 stay on the 5-significant-digit grid', () => {
+    const widened = computeLadder(inputs({ market: market('999.9', '1000'), extraBps: 1.5, widenTicks: new Map([['ask:0', 2], ['ask:1', 1], ['bid:2', 3]]) }));
+    expect(widened.quotes.length).toBeGreaterThan(0);
+    for (const q of widened.quotes) { expect(onGrid(q.price, 2)).toBe(true); expect(significantDigits(q.price)).toBeLessThanOrEqual(5); }
+  });
+});

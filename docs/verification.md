@@ -58,7 +58,7 @@ Proxy credentials live only in the gitignored `quoter/.env`. Logs mask proxy use
 
 ## Automated checks
 
-`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **56 tests, 0 failures, 944 assertions**.
+`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **67 tests, 0 failures** (three consecutive runs).
 
 | Behavior | Evidence |
 |---|---|
@@ -82,6 +82,17 @@ Proxy credentials live only in the gitignored `quoter/.env`. Logs mask proxy use
 ## Dashboard
 
 The local panel at `http://127.0.0.1:4320` was checked in the in-app browser during a dry-run on PLTR-USD. It showed the DRY-RUN banner, status, live mid/spread, the simulated ladder at 3.8 / 8.4 / 17.1 bps, the 10-minute mid and quote chart with the uptime strip, band usage against the $100k cap with competing depth, events and feed status. At 375 px width the document did not overflow horizontally. The Stop button (confirmation accepted) stopped the process with reason `dashboard stop`, and the page then showed the stopped state.
+
+## Code review fixes — 20 October 2026
+
+An independent `/code-review` (xhigh) of `main...feature/perps-quoter` reported 15 findings. All are fixed and covered by regression tests in `quoter/test/stateRisk.test.ts`, `quoteEngine.test.ts` and `liveMock.test.ts`:
+
+- Reconcile can no longer drop an acknowledged order: snapshots are judged against the time they were requested, reconciles never overlap a quote cycle, and an own order that surfaces outside its slot is re-adopted or cancelled as a stray (no unmanaged duplicates).
+- A refused startup touches nothing: shutdown cancels only after the bot owns the book and disarms only a deadline it armed itself (mock test with a foreign order and another session's deadline).
+- Two missed dead-man re-arms pull all quotes until the deadline is confirmed again; single-object acknowledgements require `status: "ok"` in the body.
+- Tick moves use grid neighbours, so prices across a decade (999.99 → 1000.0) stay within 5 significant digits; off-grid prices or quantities are skipped.
+- Partial portfolio frames update only the fields present. The volatility breaker precedes any freeze, and a freeze longer than `max_freeze_s` pulls quotes.
+- The instrument poll matches by id. The daily-loss anchor persists across restarts. A resync requested during a reconcile survives it, and the private stream requests one after subscribing. The pull-path `cancelAll` is sent once and verified. Finished orders are pruned. Missing fees and PnL stay null. The mock-exchange test no longer races the `orders` event.
 
 ## Limitations
 

@@ -1,5 +1,5 @@
 import { errorText, type Logger } from './log.ts';
-import type { WriteOutcome } from './rest.ts';
+import { acknowledged, type WriteOutcome } from './rest.ts';
 import type { Operation } from './signer.ts';
 
 export interface AutoCancelStatus { deadline: number; triggered: number; dailyLimit: number; nextReset: number; }
@@ -17,6 +17,7 @@ export interface DeadmanPort {
 export class Deadman {
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastDeadline = 0;
+  private confirmedOnce = false;
   failures = 0;
 
   constructor(private readonly port: DeadmanPort, private readonly options: { timeoutS: number; rearmEveryS: number }, private readonly log: Logger, private readonly alert: (message: string) => void) {}
@@ -24,18 +25,20 @@ export class Deadman {
   async arm(): Promise<number> {
     const deadline = this.port.nowMs() + this.options.timeoutS * 1_000;
     const outcome = await this.port.write({ type: 'autoCancel', args: { time: deadline } });
-    if (outcome.kind === 'ok') {
-      const confirmed = (outcome.body as { deadline?: unknown }).deadline;
+    if (acknowledged(outcome)) {
+      const confirmed = ((outcome as { body?: unknown }).body as { deadline?: unknown }).deadline;
       this.lastDeadline = typeof confirmed === 'number' ? confirmed : deadline;
       this.failures = 0;
+      this.confirmedOnce = true;
       return this.lastDeadline;
     }
     this.failures++;
-    if (outcome.kind === 'indeterminate') {
+    if (outcome.kind !== 'rejected') {
       try { const status = await this.port.readStatus(); this.lastDeadline = status.deadline; } catch (error) { this.log.warn('auto-cancel readback failed', { error: errorText(error) }); }
     }
-    this.alert(`auto-cancel re-arm ${outcome.kind}: ${outcome.error}; last confirmed deadline ${this.lastDeadline ? new Date(this.lastDeadline).toISOString() : 'none'}`);
-    throw new Error(`auto-cancel ${outcome.kind}: ${outcome.error}`);
+    const why = outcome.kind === 'ok' ? 'no ok status in body' : outcome.error;
+    this.alert(`auto-cancel re-arm ${outcome.kind}: ${why}; last confirmed deadline ${this.lastDeadline ? new Date(this.lastDeadline).toISOString() : 'none'}`);
+    throw new Error(`auto-cancel ${outcome.kind}: ${why}`);
   }
 
   start(): void {
@@ -48,8 +51,10 @@ export class Deadman {
   async disarm(): Promise<void> {
     this.stop();
     const outcome = await this.port.write({ type: 'autoCancel', args: { time: 0 } });
-    if (outcome.kind !== 'ok') this.log.warn('auto-cancel disarm not confirmed; the deadline will still fire', { kind: outcome.kind, error: outcome.error });
+    if (!acknowledged(outcome)) this.log.warn('auto-cancel disarm not confirmed; the deadline will still fire', { kind: outcome.kind, error: outcome.kind === 'ok' ? 'no ok status in body' : outcome.error });
     else this.lastDeadline = 0;
   }
   deadline(): number { return this.lastDeadline; }
+  /** True once this process has a confirmed deadline of its own. */
+  armed(): boolean { return this.confirmedOnce; }
 }

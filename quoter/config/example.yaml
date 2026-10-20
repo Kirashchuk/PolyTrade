@@ -45,6 +45,7 @@ risk:
   post_only_reject_widen: {after: 3, ticks: 1, for_s: 10}
   startup_cancel_all: true  # cancel pre-existing orders on this instrument at start; false refuses to start instead
   reconcile_every_s: 30     # periodic REST reconcile in addition to the private stream
+  max_freeze_s: 15          # a freeze (state unverified) longer than this pulls all quotes
 
 deadman:
   timeout_s: 60

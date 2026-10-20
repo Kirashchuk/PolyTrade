@@ -1,4 +1,4 @@
-import { D, wire, type Dec } from './decimal.ts';
+import { bpsBetween, D, wire, type Dec } from './decimal.ts';
 import type { Instrument } from './instruments.ts';
 import { errorText, type Logger } from './log.ts';
 import type { SlotKey, TargetLadder, TargetQuote } from './quoteEngine.ts';
@@ -32,12 +32,14 @@ export function planActions(ladder: TargetLadder | null, state: StateStore, inst
     if (!options.allowNew) continue;
     if (needsModify(resting, target, ladder!, instrument, options)) plan.modifies.push({ slot, coid: resting.coid, target, qtyTotal: resting.filled.plus(target.qty) });
   }
+  // Own orders resting outside their slot (a slot was re-placed before the old order surfaced) are always cancelled.
+  for (const stray of state.strays()) if (!stray.inFlight) plan.cancels.push({ slot: null, coid: stray.coid, reason: 'stray' });
   return plan;
 }
 
 function needsModify(live: OwnOrder, target: TargetQuote, ladder: TargetLadder, instrument: Instrument, options: PlanOptions): boolean {
   if (live.price.eq(target.price) && live.rest.gte(target.qty.mul(options.refillRatio)) && live.rest.lte(target.qty)) return false;
-  const moveBps = live.price.minus(target.price).abs().div(ladder.mid).mul(10_000).toNumber();
+  const moveBps = bpsBetween(live.price, target.price, ladder.mid);
   const liveBand = bandOf(live.side, live.price, ladder.mid, instrument.priceDecimals);
   return moveBps >= options.thresholdBps || liveBand === 0 || liveBand > target.band || live.rest.lt(target.qty.mul(options.refillRatio)) || live.rest.gt(target.qty);
 }
@@ -83,20 +85,21 @@ export class Executor {
     const report: ExecutionReport = { sent: 0, indeterminate: false, errors: [] };
     if (plan.cancels.length) {
       const coids = plan.cancels.map((c) => c.coid);
-      for (const coid of coids) { const o = this.state.orders.get(coid); if (o) o.inFlight = true; }
+      for (const coid of coids) { const o = this.state.orders.get(coid); if (o) { o.inFlight = true; this.state.touch(coid); } }
       const outcome = await this.port.write({ type: 'cancelOrdersCOID', args: coids });
       report.sent++;
       if (!this.settle(outcome, coids, report, (coid, result) => {
         const order = this.state.orders.get(coid);
         if (!order) return;
         order.inFlight = false;
+        this.state.touch(coid);
         if (result.status === 'ok' || GONE_ERRORS.has(String(result.error))) { order.status = 'cancelled'; order.rest = new D(0); this.state.release(coid); }
         else report.errors.push(`cancel ${coid}: ${result.error}`);
       })) return report;
     }
     if (plan.modifies.length) {
       const args: ModifyArgs[] = plan.modifies.map((m) => ({ coid: m.coid, p: wire(m.target.price), qty: wire(m.qtyTotal) }));
-      for (const m of plan.modifies) { const o = this.state.orders.get(m.coid); if (o) o.inFlight = true; }
+      for (const m of plan.modifies) { const o = this.state.orders.get(m.coid); if (o) { o.inFlight = true; this.state.touch(m.coid); } }
       const outcome = await this.port.write({ type: 'modifyOrdersCOID', args });
       report.sent++;
       if (!this.settle(outcome, args.map((a) => a.coid), report, (coid, result) => {
@@ -120,6 +123,7 @@ export class Executor {
         if (!order) return;
         order.inFlight = false;
         if (result.status === 'ok') {
+          this.state.touch(coid);
           if (typeof result.oid === 'number') order.oid = result.oid;
           if (order.status === 'submitting') { order.status = 'accepted'; order.rest = order.qty; }
         } else { order.status = `rejected:${result.error}`; this.state.release(coid); report.errors.push(`place ${coid}: ${result.error}`); }

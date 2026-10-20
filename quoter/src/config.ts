@@ -21,6 +21,7 @@ export interface Settings {
     postOnlyRejectWiden: { after: number; ticks: number; forS: number };
     startupCancelAll: boolean;
     reconcileEveryS: number;
+    maxFreezeS: number;
   };
   deadman: { timeoutS: number; rearmEveryS: number };
   sessions: Record<SessionName, SessionProfile> & { schedule: 'auto' | 'regular' };
@@ -130,6 +131,7 @@ export function parseSettings(input: unknown): ConfigReport {
       },
       startupCancelAll: bool(risk, 'startup_cancel_all', 'risk', true),
       reconcileEveryS: num(risk, 'reconcile_every_s', 'risk', 30, 5, 3_600),
+      maxFreezeS: num(risk, 'max_freeze_s', 'risk', 15, 2, 600),
     },
     deadman: { timeoutS: num(deadman, 'timeout_s', 'deadman', 60, 10, 3_600), rearmEveryS: num(deadman, 'rearm_every_s', 'deadman', 20, 5, 1_800) },
     sessions: {

@@ -1,5 +1,5 @@
 import type { LevelConfig, SessionProfile, Settings } from './config.ts';
-import { D, type Dec } from './decimal.ts';
+import { bpsBetween, D, gridNeighbor, gridShift, onGrid, significantDigits, type Dec } from './decimal.ts';
 import { ceilPrice, ceilQty, floorPrice, floorQty, priceTick, type Instrument } from './instruments.ts';
 import { bandEdge, bandOf, TIER_CAP_USD, type Side } from './rewards.ts';
 
@@ -46,15 +46,18 @@ export function computeLadder(input: QuoteInputs): TargetLadder {
     for (const side of ['bid', 'ask'] as const) {
       const slot = slotKey(side, index);
       const sideBps = Math.max(side === 'bid' ? base + skewBps : base - skewBps, requote.minEdgeBps);
-      const widen = tick.mul(input.widenTicks.get(slot) ?? 0);
       const fraction = new D(sideBps).div(10_000);
-      let price = side === 'bid' ? floorPrice(instrument, mid.mul(new D(1).minus(fraction))).minus(widen) : ceilPrice(instrument, mid.mul(fraction.plus(1))).plus(widen);
+      const pd = instrument.priceDecimals, away = side === 'ask'; // "away" from mid = up for asks, down for bids
+      // Every tick move goes to the neighbouring grid point: the step changes across a decade (999.99 → 1000.0).
+      let price = side === 'bid' ? floorPrice(instrument, mid.mul(new D(1).minus(fraction))) : ceilPrice(instrument, mid.mul(fraction.plus(1)));
+      price = gridShift(price, pd, input.widenTicks.get(slot) ?? 0, away);
       // Post-only: never lock or cross the opposite best price.
-      price = side === 'bid' ? D.min(price, bestAsk.minus(tick)) : D.max(price, bestBid.plus(tick));
+      price = side === 'bid' ? D.min(price, gridNeighbor(bestAsk, pd, false)) : D.max(price, gridNeighbor(bestBid, pd, true));
       // Keep the order inside its target band with one tick of margin from the (outward-rounded) edge.
-      const edge = bandEdge(side, level.band, mid, instrument.priceDecimals);
-      if (side === 'bid' ? price.lte(edge) : price.gte(edge)) price = side === 'bid' ? edge.plus(tick) : edge.minus(tick);
+      const edge = bandEdge(side, level.band, mid, pd);
+      if (side === 'bid' ? price.lte(edge) : price.gte(edge)) price = gridNeighbor(edge, pd, !away);
       if (price.lte(0)) { warnings.push(`${slot}: nonpositive price`); continue; }
+      if (!onGrid(price, pd)) { warnings.push(`${slot}: price ${price.toFixed()} is off the exchange grid; level skipped`); continue; }
       const band = bandOf(side, price, mid, instrument.priceDecimals);
       if (band === 0 || band > level.band) { warnings.push(`${slot}: cannot stay inside band ${level.band} after rounding; level skipped`); continue; }
       if (side === 'bid' ? price.gte(bestAsk) : price.lte(bestBid)) { warnings.push(`${slot}: would cross; level skipped`); continue; }
@@ -67,7 +70,8 @@ export function computeLadder(input: QuoteInputs): TargetLadder {
       }
       if (qty.mul(price).gt(instrument.maxLimitNotional)) qty = floorQty(instrument, instrument.maxLimitNotional.div(price));
       if (qty.lte(0) || qty.mul(price).lt(instrument.minNotional)) { warnings.push(`${slot}: below min_notional; level skipped`); continue; }
-      quotes.push({ slot, side, level: index, band: level.band, price, qty, notional: qty.mul(price).toNumber(), distBps: price.minus(mid).abs().div(mid).mul(10_000).toNumber() });
+      if (significantDigits(qty) > 5) { warnings.push(`${slot}: quantity ${qty.toFixed()} is off the exchange grid; level skipped`); continue; }
+      quotes.push({ slot, side, level: index, band: level.band, price, qty, notional: qty.mul(price).toNumber(), distBps: bpsBetween(price, mid, mid) });
     }
   });
 

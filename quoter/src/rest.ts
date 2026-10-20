@@ -15,6 +15,10 @@ export type WriteOutcome =
 /** Statuses that prove the request was not executed. Anything else that is not 2xx is indeterminate. */
 const DEFINITE_REJECTION = new Set([400, 401, 403, 404, 405, 409, 413, 415, 422, 429]);
 
+/** A single-object acknowledgement counts only with an explicit `status: "ok"` in the body. */
+export const acknowledged = (outcome: WriteOutcome): boolean =>
+  outcome.kind === 'ok' && typeof outcome.body === 'object' && outcome.body !== null && (outcome.body as { status?: unknown }).status === 'ok';
+
 export class HttpError extends Error {
   constructor(readonly status: number, readonly path: string, readonly code: string) { super(`${path}: HTTP ${status} ${code}`); }
 }

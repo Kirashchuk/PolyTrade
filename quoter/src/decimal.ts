@@ -43,6 +43,20 @@ export function toGrid(value: Decimal.Value, decimals: number, up = false): Dec 
   return result;
 }
 
+/**
+ * Nearest grid point strictly above (or below) `value`. Across a decade boundary the step changes
+ * (999.99 → 1000.0 → 1000.1), so neighbours are found on the grid itself, never by adding a fixed tick.
+ */
+export function gridNeighbor(value: Decimal.Value, decimals: number, up: boolean): Dec {
+  const nudge = new D(10).pow(-(decimals + 2));
+  return toGrid(up ? new D(value).plus(nudge) : new D(value).minus(nudge), decimals, up);
+}
+export function gridShift(value: Decimal.Value, decimals: number, steps: number, up: boolean): Dec {
+  let result = new D(value);
+  for (let i = 0; i < steps; i++) result = gridNeighbor(result, decimals, up);
+  return result;
+}
+
 export function onGrid(value: Decimal.Value, decimals: number): boolean {
   const raw = new D(value);
   return raw.gt(0) && raw.mod(gridStep(raw, decimals)).isZero();
@@ -53,4 +67,5 @@ export function significantDigits(value: Decimal.Value): number { return new D(v
 /** Wire format: plain notation, no exponent, no trailing zeros. */
 export const wire = (value: Decimal.Value): string => new D(value).toFixed();
 
-export const bpsBetween = (price: Decimal.Value, mid: Decimal.Value): number => new D(price).minus(mid).abs().div(mid).mul(10_000).toNumber();
+/** |a − b| in basis points of `reference`. */
+export const bpsBetween = (a: Decimal.Value, b: Decimal.Value, reference: Decimal.Value): number => new D(a).minus(b).abs().div(reference).mul(10_000).toNumber();

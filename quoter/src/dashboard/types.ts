@@ -27,7 +27,7 @@ export interface DashboardState {
   limits: { maxPositionUsd: number; maxDailyLossUsd: number; minAvailableMarginUsd: number };
   metrics: Record<string, unknown>;
   history: HistoryPoint[];
-  fills: { t: number; side: string; price: string; qty: string; fee: number; taker: boolean }[];
+  fills: { t: number; side: string; price: string; qty: string; fee: number | null; taker: boolean }[];
   deadmanDeadline: number | null;
   credentialExpiresAt: number | null;
 }

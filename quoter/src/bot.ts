@@ -1,8 +1,10 @@
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { Settings } from './config.ts';
 import type { Credentials } from './credentials.ts';
 import { Deadman, type AutoCancelStatus } from './deadman.ts';
-import { D, type Dec } from './decimal.ts';
+import { bpsBetween, D, type Dec } from './decimal.ts';
 import type { EgressPool } from './egress.ts';
 import { Executor, planActions, prioritize, TokenBucket } from './executor.ts';
 import { parseInstrument, type Instrument } from './instruments.ts';
@@ -11,14 +13,14 @@ import { MarketData, type MarketState } from './marketData.ts';
 import { Metrics } from './metrics.ts';
 import { PrivateStream } from './privateStream.ts';
 import { computeLadder, slotKey, type SlotKey, type TargetLadder } from './quoteEngine.ts';
-import type { Clock, RestClient, WriteOutcome } from './rest.ts';
+import { acknowledged, type Clock, type RestClient, type WriteOutcome } from './rest.ts';
 import { rewardPeriodStart, type RestingQuote } from './rewards.ts';
 import { RiskManager } from './risk.ts';
 import { currentSession } from './sessions.ts';
 import type { SessionName } from './config.ts';
 import type { DashboardState, HistoryPoint, LadderRow, RunStatus } from './dashboard/types.ts';
 import { signOperation, type Operation } from './signer.ts';
-import { StateStore } from './state.ts';
+import { StateStore, type EquityAnchor } from './state.ts';
 
 export interface BotOptions {
   settings: Settings; instrument: Instrument; egress: EgressPool; rest: RestClient; clock: Clock; log: Logger;
@@ -52,6 +54,10 @@ export class QuoterBot {
   private exchangeCancelOnly = false;
   private instrumentHalted: string | null = null;
   private ladder: TargetLadder | null = null;
+  /** Set once startup has checked (or cleared) the instrument's book; only then does shutdown cancel on it. */
+  private ownsBook = false;
+  private lastPullCancelAt = 0;
+  private savedAnchor: string | null = null;
   private runStatus: RunStatus = 'starting';
   private statusReason = '';
   private notes: string[] = [];
@@ -119,8 +125,12 @@ export class QuoterBot {
       await this.reconcile('startup');
       if (this.state.foreign.length) {
         if (!settings.risk.startupCancelAll) throw new Error(`${this.state.foreign.length} open order(s) not owned by this process on ${instrument.symbol}; cancel them or set risk.startup_cancel_all`);
+        this.ownsBook = true;
         await this.cancelAllAndVerify('startup');
       }
+      // From here on the bot owns the instrument's book: stopping cancels everything on it.
+      this.ownsBook = true;
+      this.state.restoreAnchor(await this.loadAnchor());
       await this.ensureLeverage();
       await this.deadman!.arm();
       this.deadman!.start();
@@ -133,7 +143,7 @@ export class QuoterBot {
     this.running = true;
     this.timers.push(setInterval(() => this.requestCycle(), 1_000));
     this.timers.push(setInterval(() => this.sampleMetrics(), 1_000));
-    this.timers.push(setInterval(() => { void this.metrics.flush(); }, 5_000));
+    this.timers.push(setInterval(() => { void this.metrics.flush(); this.state.prune(); void this.saveAnchor(); }, 5_000));
     this.timers.push(setInterval(() => { if (existsSync(this.o.stopFile)) void this.stop('STOP file'); }, 1_000));
     this.timers.push(setInterval(() => { void this.refreshExchange().catch((error) => log.warn('exchange poll failed', { error: errorText(error) })); }, 60_000));
     this.timers.push(setInterval(() => { void this.o.clock.sync().catch((error) => log.warn('clock sync failed', { error: errorText(error) })); }, 300_000));
@@ -169,10 +179,15 @@ export class QuoterBot {
     if (this.cycleTimer) clearTimeout(this.cycleTimer);
     await this.waitFor(() => !this.busy, 10_000, 'in-flight quote cycle').catch(() => undefined);
     if (this.mode === 'live') {
-      let verified = false;
-      try { await this.cancelAllAndVerify('shutdown'); verified = true; } catch (error) { log.error('shutdown cancel not verified; auto-cancel deadline remains armed', { error: errorText(error) }); }
       this.deadman?.stop();
-      if (this.deadman && verified) await this.deadman.disarm().catch((error) => log.warn('disarm failed', { error: errorText(error) }));
+      // Before the bot took ownership (e.g. startup refused foreign orders) nothing on the book is touched.
+      let verified = false;
+      if (this.ownsBook) {
+        try { await this.cancelAllAndVerify('shutdown'); verified = true; } catch (error) { log.error('shutdown cancel not verified; auto-cancel deadline remains armed', { error: errorText(error) }); }
+      }
+      // Only clear a schedule this process armed, and only once its orders are verified gone.
+      if (this.deadman?.armed() && verified) await this.deadman.disarm().catch((error) => log.warn('disarm failed', { error: errorText(error) }));
+      await this.saveAnchor();
     }
     this.market.stop();
     this.privateStream?.stop();
@@ -187,10 +202,10 @@ export class QuoterBot {
     if (outcome.kind === 'rejected') throw new Error(`cancelAll rejected: ${outcome.error}`);
     await Bun.sleep(outcome.kind === 'ok' ? 300 : 2_000);
     await this.reconcile(`after cancelAll (${reason})`);
-    if (this.state.liveCoids().length || this.state.foreign.length) {
+    if (this.state.ownLiveCount() || this.state.foreign.length) {
       await Bun.sleep(1_000);
       await this.reconcile(`after cancelAll (${reason}), second check`);
-      if (this.state.liveCoids().length || this.state.foreign.length) throw new Error('Open orders remain after cancelAll');
+      if (this.state.ownLiveCount() || this.state.foreign.length) throw new Error('Open orders remain after cancelAll');
     }
   }
 
@@ -215,27 +230,42 @@ export class QuoterBot {
   }
   private lastReconcile: number | null = null;
 
+  /**
+   * REST reconcile. Reconciles are queued (a caller always gets a snapshot taken after it asked) and never overlap a
+   * quote cycle: the snapshot is requested only once no write is in progress, and no cycle starts until it is applied.
+   */
   async reconcile(reason: string): Promise<void> {
-    if (this.reconciling) return;
+    while (this.reconcileTask) await this.reconcileTask.catch(() => undefined);
+    const task = this.runReconcile(reason);
+    this.reconcileTask = task;
+    try { await task; } finally { if (this.reconcileTask === task) this.reconcileTask = null; }
+  }
+  private reconcileTask: Promise<void> | null = null;
+
+  private async runReconcile(reason: string): Promise<void> {
     this.reconciling = true;
     try {
-      const auth = this.auth();
+      await this.waitFor(() => !this.busy, 15_000, 'quote cycle to finish before reconcile');
+      const auth = this.auth(), asOf = this.now(), generation = this.state.resyncGeneration();
       const [open, portfolio] = await Promise.all([
         this.o.rest.getPrivate<unknown[]>('/v1/account/open-orders', auth, { instrument_id: this.o.instrument.id }),
         this.o.rest.getPrivate<unknown>('/v1/account/portfolio', auth),
       ]);
-      const unresolved = this.state.applyOpenOrders(open);
+      const unresolved = this.state.applyOpenOrders(open, asOf);
       this.state.applyPortfolio(portfolio);
-      if (unresolved) this.state.markResync(`${unresolved} submitted order(s) not yet visible`); else this.state.resynced();
+      if (unresolved) this.state.markResync(`${unresolved} submitted order(s) not yet visible`); else this.state.resynced(generation);
       this.lastReconcile = this.now();
-      if (reason !== 'periodic') this.o.log.info('reconciled', { reason, ownLive: this.state.liveCoids().length, foreign: this.state.foreign.length, position: this.state.snapshot().positionQty.toFixed() });
-    } finally { this.reconciling = false; }
+      if (reason !== 'periodic') this.o.log.info('reconciled', { reason, ownLive: this.state.liveCoids().length, strays: this.state.strays().length, foreign: this.state.foreign.length, position: this.state.snapshot().positionQty.toFixed() });
+    } finally {
+      this.reconciling = false;
+      if (this.running) this.requestCycle();
+    }
   }
 
   // ---------- quoting ----------
   requestCycle(): void {
     if (!this.running) return;
-    if (this.busy) { this.dirty = true; return; }
+    if (this.busy || this.reconciling) { this.dirty = true; return; }
     const wait = this.o.settings.requote.minIntervalMs - (this.now() - this.lastCycle);
     if (wait > 0) { this.cycleTimer ??= setTimeout(() => { this.cycleTimer = null; this.requestCycle(); }, wait); return; }
     void this.cycle();
@@ -266,6 +296,7 @@ export class QuoterBot {
       exchangeCancelOnly: this.exchangeCancelOnly, instrumentHalted: this.instrumentHalted,
       postOnlyRejects: this.state.postOnlyRejects,
       proxyExpiresAt: this.o.credentials?.expiresAt ?? null,
+      deadmanDeadline: this.deadman ? this.deadman.deadline() : null,
       killSwitch: existsSync(this.o.stopFile),
     });
 
@@ -275,12 +306,17 @@ export class QuoterBot {
     if (action.kind === 'halt') { this.ladder = null; void this.stop(action.reason === 'kill switch' ? 'kill switch' : `risk halt: ${action.reason}`); return; }
     if (action.kind === 'pull') {
       this.ladder = null;
-      const settling = /^(indeterminate|cancelAll)/.test(this.state.needsResync() ?? '') && this.now() - this.lastWriteAt < 3_000;
-      if (this.mode === 'live' && !settling && (this.state.liveCoids().length || this.state.foreign.length)) {
+      // One cancelAll per pull, then a REST check; no resend while an earlier one is unverified.
+      const settling = this.now() - this.lastPullCancelAt < 3_000 || (/^(indeterminate|cancelAll)/.test(this.state.needsResync() ?? '') && this.now() - this.lastWriteAt < 3_000);
+      if (this.mode === 'live' && !settling && (this.state.ownLiveCount() || this.state.foreign.length)) {
+        this.lastPullCancelAt = this.now();
         const outcome = await this.write({ type: 'cancelAll', args: { iid: instrument.id } });
         log.warn('quotes pulled', { reason: action.reason, kind: outcome.kind });
-        if (outcome.kind === 'ok') for (const coid of this.state.liveCoids()) { const o = this.state.orders.get(coid); if (o) { o.status = 'cancelled'; o.rest = new D(0); } this.state.release(coid); }
-        else this.state.markResync(`cancelAll ${outcome.kind}`);
+        if (acknowledged(outcome)) {
+          for (const order of this.state.orders.values()) if (order.rest.gt(0) || order.status === 'accepted') { order.status = 'cancelled'; order.rest = new D(0); order.inFlight = false; this.state.release(order.coid); }
+          this.state.foreign = [];
+        }
+        this.state.markResync(`cancelAll ${outcome.kind}: verify`);
       }
       this.printThrottled(`PAUSED: ${action.reason}`);
       return;
@@ -319,6 +355,29 @@ export class QuoterBot {
     return this.o.settings.levels.flatMap((_, index) => [slotKey('bid', index), slotKey('ask', index)]);
   }
 
+  // ---------- daily-loss anchor ----------
+  /** Account value at the reward-period start survives restarts, so a restart does not reset the daily-loss limit. */
+  private anchorFile(): string { return join(this.o.settings.metrics.dir, 'equity-anchor.json'); }
+  private accountKey(): string { return (this.o.credentials?.owner ?? this.o.credentials?.auth.proxy ?? 'dry-run').toLowerCase(); }
+  private async loadAnchor(): Promise<EquityAnchor | null> {
+    try {
+      const file = Bun.file(this.anchorFile());
+      if (!(await file.exists())) return null;
+      const saved = await file.json() as { account?: string; periodStart?: number; value?: number };
+      if (saved.account !== this.accountKey() || saved.periodStart !== rewardPeriodStart(this.now()) || typeof saved.value !== 'number') return null;
+      this.o.log.info('daily PnL anchor restored', { periodStart: new Date(saved.periodStart).toISOString(), value: saved.value });
+      return { periodStart: saved.periodStart, value: saved.value };
+    } catch (error) { this.o.log.warn('daily PnL anchor unreadable', { error: errorText(error) }); return null; }
+  }
+  private async saveAnchor(): Promise<void> {
+    const anchor = this.state.anchor();
+    if (this.mode !== 'live' || !anchor) return;
+    const text = JSON.stringify({ account: this.accountKey(), ...anchor });
+    if (text === this.savedAnchor) return;
+    try { await mkdir(this.o.settings.metrics.dir, { recursive: true }); await Bun.write(this.anchorFile(), text); this.savedAnchor = text; }
+    catch (error) { this.o.log.warn('daily PnL anchor not saved', { error: errorText(error) }); }
+  }
+
   // ---------- monitoring ----------
   private sampleMetrics(): void {
     const market: MarketState = this.market.snapshot();
@@ -338,7 +397,8 @@ export class QuoterBot {
       rest.getPublic<unknown[]>('/v1/info/instruments', { instrument_id: instrument.id }),
     ]);
     this.exchangeCancelOnly = exchange.cancel_only === true;
-    const fresh = Array.isArray(rows) && rows[0] ? parseInstrument(rows[0], `${rest.base}/v1/info/instruments`, clock.nowMs()) : null;
+    const match = Array.isArray(rows) ? rows.find((row) => (row as { instrument_id?: unknown })?.instrument_id === instrument.id) : undefined;
+    const fresh = match ? parseInstrument(match, `${rest.base}/v1/info/instruments`, clock.nowMs()) : null;
     this.instrumentHalted = !fresh ? 'instrument no longer listed' : fresh.settled ? 'instrument settled' : fresh.closeOnly ? 'instrument close-only' : null;
   }
 
@@ -365,7 +425,7 @@ export class QuoterBot {
   dashboardState(): DashboardState {
     const market = this.market.snapshot(), ladder = this.ladder, account = this.state.snapshot();
     const mid = market.mid, t = this.now();
-    const bps = (price: Dec) => mid ? price.minus(mid).abs().div(mid).mul(10_000).toNumber() : null;
+    const bps = (price: Dec) => mid ? bpsBetween(price, mid, mid) : null;
     const rows: LadderRow[] = this.slots().map((slot) => {
       const [side, level] = slot.split(':') as ['bid' | 'ask', string];
       const target = ladder?.quotes.find((q) => q.slot === slot) ?? null;

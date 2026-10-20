@@ -23,6 +23,8 @@ export class PrivateStream {
         const sub = await socket.request({ req: 'sub', chs: ['orders', 'fills', 'portfolio', 'balances'] });
         if (Array.isArray(sub) && sub.some((item) => (item as { status?: string })?.status === 'err')) throw new Error(`private subscription rejected: ${JSON.stringify(sub)}`);
         this.authorized = true;
+        // Frames before the subscription were not received: state must be rebuilt from REST after this point.
+        state.markResync('private stream subscribed');
       },
       onFrame: (frame) => this.onFrame(frame),
       onState: (s, note) => { if (s !== 'open') this.authorized = false; log.info('private stream', { state: s, note }); },

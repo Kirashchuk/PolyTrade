@@ -11,6 +11,8 @@ interface Accumulator {
   periodStart: number; samples: number; qualifying: number; scoreSum: number;
   bid: BandNotional; ask: BandNotional; bookBid: BandNotional; bookAsk: BandNotional;
   makerVolume: number; takerVolume: number; fees: number; realizedPnl: number; fills: number;
+  /** Fills whose fee or PnL the exchange did not report: those totals are then incomplete, not zero. */
+  feesUnknown: number; pnlUnknown: number;
 }
 const zero = (): BandNotional => [0, 0, 0];
 const add = (into: BandNotional, value: BandNotional) => { for (let i = 0; i < 3; i++) into[i]! += value[i]!; };
@@ -32,7 +34,7 @@ export class Metrics {
   }
 
   private fresh(periodStart: number): Accumulator {
-    return { periodStart, samples: 0, qualifying: 0, scoreSum: 0, bid: zero(), ask: zero(), bookBid: zero(), bookAsk: zero(), makerVolume: 0, takerVolume: 0, fees: 0, realizedPnl: 0, fills: 0 };
+    return { periodStart, samples: 0, qualifying: 0, scoreSum: 0, bid: zero(), ask: zero(), bookBid: zero(), bookAsk: zero(), makerVolume: 0, takerVolume: 0, fees: 0, realizedPnl: 0, fills: 0, feesUnknown: 0, pnlUnknown: 0 };
   }
   setMakerShare(pct: number | null): void { this.makerSharePct = pct; }
 
@@ -66,7 +68,9 @@ export class Metrics {
     for (const fill of fills) {
       const notional = fill.price.mul(fill.qty).toNumber();
       if (fill.taker) this.acc.takerVolume += notional; else this.acc.makerVolume += notional;
-      this.acc.fees += fill.fee; this.acc.realizedPnl += fill.pnl; this.acc.fills++;
+      if (fill.fee === null) this.acc.feesUnknown++; else this.acc.fees += fill.fee;
+      if (fill.pnl === null) this.acc.pnlUnknown++; else this.acc.realizedPnl += fill.pnl;
+      this.acc.fills++;
     }
   }
 
@@ -84,7 +88,8 @@ export class Metrics {
       sideScores: { bid: Math.round(sideScore(bid)), ask: Math.round(sideScore(ask)) },
       makerSharePct: this.makerSharePct,
       estRawScore: this.makerSharePct === null ? null : Number(rawScore(makerScore(this.makerSharePct), liquidity, uptime).toFixed(2)),
-      makerVolume: Math.round(a.makerVolume), takerVolume: Math.round(a.takerVolume), fees: Number(a.fees.toFixed(4)), realizedPnl: Number(a.realizedPnl.toFixed(4)), fills: a.fills,
+      makerVolume: Math.round(a.makerVolume), takerVolume: Math.round(a.takerVolume), fees: a.fills && a.feesUnknown === a.fills ? null : Number(a.fees.toFixed(4)), feesUnknown: a.feesUnknown,
+      realizedPnl: a.fills && a.pnlUnknown === a.fills ? null : Number(a.realizedPnl.toFixed(4)), pnlUnknown: a.pnlUnknown, fills: a.fills,
     };
   }
 

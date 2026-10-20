@@ -132,7 +132,7 @@ describe('live path against a local mock exchange', () => {
     for (const o of exchange.orders.values()) { expect(o.tif).toBe('gtc'); expect(o.po).toBe(true); }
     const bids = [...exchange.orders.values()].filter((o) => o.buy).map((o) => o.p).sort();
     expect(bids).toEqual(['195.43', '195.6', '195.69']);
-    await until(() => bot.state.restingQuotes().length === 6);
+    await until(() => bot.dashboardState().ladder.filter((row) => row.live?.status === 'open').length === 6);
     const view = bot.dashboardState();
     expect(view.mode).toBe('live');
     expect(view.ladder.filter((row) => row.live?.status === 'open')).toHaveLength(6);
@@ -153,6 +153,30 @@ describe('live path against a local mock exchange', () => {
     expect(exchange.writes.some((w) => w.type === 'cancelAll')).toBe(true);
     expect(exchange.autoCancel).toBe(0); // disarmed after verified cancel
     expect(exchange.writes.every((w) => w.sigOk)).toBe(true);
+    await import('node:fs/promises').then((fs) => fs.rm(settings.metrics.dir, { recursive: true, force: true }));
+  }, 30_000);
+
+  test('a refused startup leaves foreign orders and another session\'s auto-cancel deadline untouched', async () => {
+    exchange.orders.clear(); exchange.writes.length = 0;
+    const foreignDeadline = Date.now() + 45_000;
+    exchange.autoCancel = foreignDeadline;
+    const manual = 'd'.repeat(32);
+    exchange.orders.set(manual, { oid: 999, iid: 45, buy: true, p: '190', qty: '1', rest: '1', fill: '0', status: 'open', coid: manual, tif: 'gtc', po: true });
+    const { settings } = parseSettings(Bun.YAML.parse(await Bun.file(new URL('../config/example.yaml', import.meta.url)).text()));
+    settings.mode = 'live'; settings.egress.allowDirect = true; settings.risk.startupCancelAll = false;
+    settings.metrics.dir = `${import.meta.dir}/.tmp-metrics-2`;
+    const log = silentLog();
+    const egress = new EgressPool({ proxies: [], allowDirect: true, timeoutMs: 2_000, log });
+    const rest = new RestClient(egress, log, base);
+    const clock = new Clock(rest);
+    await clock.sync();
+    const credentials: Credentials = { auth: { proxy: signer.address, secret: 'mock-secret' }, signer, expiresAt: Date.now() + 86_400_000 * 2, owner: null, origin: 'environment' };
+    const bot = new QuoterBot({ settings, instrument: parseInstrument(PLTR_ROW, base, Date.now()), egress, rest, clock, log, credentials, stopFile: `${import.meta.dir}/.no-stop-file`, wsUrl: `ws://127.0.0.1:${server.port}/v1/ws` });
+    await expect(bot.start()).rejects.toThrow('not owned by this process');
+    await bot.stop('startup failure');
+    expect(exchange.writes).toHaveLength(0);              // no cancelAll, no autoCancel
+    expect(exchange.orders.get(manual)!.status).toBe('open');
+    expect(exchange.autoCancel).toBe(foreignDeadline);
     await import('node:fs/promises').then((fs) => fs.rm(settings.metrics.dir, { recursive: true, force: true }));
   }, 30_000);
 });

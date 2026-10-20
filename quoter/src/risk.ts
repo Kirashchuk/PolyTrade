@@ -16,6 +16,8 @@ export interface RiskInputs {
   instrumentHalted: string | null;
   postOnlyRejects: ReadonlyMap<SlotKey, number>;
   proxyExpiresAt: number | null;
+  /** Live mode: last exchange-confirmed auto-cancel deadline (0 = none). Null in dry-run. */
+  deadmanDeadline: number | null;
   killSwitch: boolean;
 }
 export type RiskAction =
@@ -33,6 +35,7 @@ export class RiskManager {
   private widenUntil = new Map<SlotKey, number>();
   private haltReason: string | null = null;
   private lastAlert = new Map<string, number>();
+  private frozenSince: number | null = null;
 
   constructor(private readonly settings: Settings, private readonly alert: (key: string, message: string) => void) {}
 
@@ -50,11 +53,15 @@ export class RiskManager {
     if (input.proxyExpiresAt !== null && input.proxyExpiresAt - input.now < 86_400_000) this.alertOnce('proxy-expiry', `Polymarket proxy credential expires at ${new Date(input.proxyExpiresAt).toISOString()}`, input.now, 3_600_000);
     if (input.proxyExpiresAt !== null && input.proxyExpiresAt - input.now < this.settings.deadman.timeoutS * 2_000) return halt('Polymarket proxy credential about to expire');
 
-    if (!input.publicConnected || input.bookStatus !== 'live') return { kind: 'pull', reason: `market data ${input.publicConnected ? input.bookStatus : 'disconnected'}` };
-    if (input.resyncPending) return { kind: 'freeze', reason: `resync: ${input.resyncPending}`, allowCancel: false };
-    if (!input.privateHealthy) return { kind: 'freeze', reason: 'private stream unhealthy', allowCancel: false };
-    if (input.exchangeCancelOnly) return { kind: 'freeze', reason: 'exchange cancel-only mode', allowCancel: true };
+    if (!input.publicConnected || input.bookStatus !== 'live') return this.unfreeze({ kind: 'pull', reason: `market data ${input.publicConnected ? input.bookStatus : 'disconnected'}` });
+    // Unprotected orders must not rest: two missed re-arms, or an expired deadline, pull everything.
+    const rearmMs = this.settings.deadman.rearmEveryS * 1_000;
+    if (input.deadmanDeadline !== null && input.deadmanDeadline - input.now < rearmMs) {
+      this.alertOnce('deadman-health', "Dead man's switch deadline not renewed; quotes pulled until it is", input.now, 60_000);
+      return this.unfreeze({ kind: 'pull', reason: "dead man's switch not confirmed" });
+    }
 
+    // The volatility breaker is checked before any freeze so a frozen state never hides a fast market.
     const breaker = risk.volBreaker;
     let extraBps = 0;
     if (input.moveBps > breaker.moveBps) {
@@ -62,9 +69,18 @@ export class RiskManager {
       this.alertOnce('vol', `Volatility breaker: ${input.moveBps.toFixed(1)} bps in ${breaker.windowS}s`, input.now, 30_000);
     }
     if (input.now < this.pausedUntil) {
-      if (breaker.action === 'pause') return { kind: 'pull', reason: `volatility pause until ${new Date(this.pausedUntil).toISOString()}` };
+      if (breaker.action === 'pause') return this.unfreeze({ kind: 'pull', reason: `volatility pause until ${new Date(this.pausedUntil).toISOString()}` });
       extraBps = breaker.widenBps;
     }
+
+    const freezeReason = input.resyncPending ? `resync: ${input.resyncPending}` : !input.privateHealthy ? 'private stream unhealthy' : input.exchangeCancelOnly ? 'exchange cancel-only mode' : null;
+    if (freezeReason) {
+      this.frozenSince ??= input.now;
+      // A freeze is meant to last one reconcile; resting orders must not outlive an unverified state for long.
+      if (input.now - this.frozenSince > risk.maxFreezeS * 1_000) return { kind: 'pull', reason: `frozen for more than ${risk.maxFreezeS}s (${freezeReason})` };
+      return { kind: 'freeze', reason: freezeReason, allowCancel: input.exchangeCancelOnly && !input.resyncPending && input.privateHealthy };
+    }
+    this.frozenSince = null;
 
     const notes: string[] = [];
     let sizeScale = 1;
@@ -80,6 +96,8 @@ export class RiskManager {
     }
     return { kind: 'quote', sizeScale, extraBps, widenTicks, notes };
   }
+
+  private unfreeze(action: RiskAction): RiskAction { this.frozenSince = null; return action; }
 
   private alertOnce(key: string, message: string, now: number, everyMs: number) {
     const last = this.lastAlert.get(key) ?? -Infinity;
