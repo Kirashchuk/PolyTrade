@@ -1,5 +1,5 @@
 import { D, gridStep, positive, toGrid, type Dec } from './decimal.ts';
-import type { Settings } from './config.ts';
+import type { QuoteProfile } from './config.ts';
 
 export interface RiskTier { lowerBound: Dec; maxLeverage: number; }
 export interface Instrument {
@@ -53,7 +53,7 @@ export function leverageLimit(instrument: Instrument, notional: Dec): number {
 }
 
 /** Check the ladder against instrument limits before anything runs. Errors stop startup; warnings are logged. */
-export function checkAgainstInstrument(settings: Settings, instrument: Instrument, mid: Dec | null): { errors: string[]; warnings: string[] } {
+export function checkAgainstInstrument(settings: QuoteProfile, instrument: Instrument, mid: Dec | null): { errors: string[]; warnings: string[] } {
   const errors: string[] = [], warnings: string[] = [];
   if (instrument.settled) errors.push(`${instrument.symbol} is settled`);
   if (instrument.closeOnly) errors.push(`${instrument.symbol} is close-only`);

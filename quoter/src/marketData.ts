@@ -30,8 +30,8 @@ function levels(value: unknown, bid: boolean): Level[] | null {
   return out;
 }
 
-/** Public market data: `book::<iid>` (top-20 snapshot every 100 ms) and `bbo::<iid>` over the egress pool. */
-export class MarketData {
+/** One instrument's order book: `book::<iid>` (top-20 snapshot every 100 ms) and `bbo::<iid>` frames routed by the feed. */
+export class MarketBook {
   private bestBid: Dec | null = null;
   private bestAsk: Dec | null = null;
   private bids: Level[] = [];
@@ -41,37 +41,20 @@ export class MarketData {
   private sequence: number | null = null;
   private source = 'none';
   private readonly history: { t: number; mid: Dec }[] = [];
-  private readonly sockets: ManagedSocket[];
   private readonly now: () => number;
 
-  constructor(readonly instrumentId: number, egress: EgressPool, private readonly rest: RestClient, private readonly log: Logger,
-    private readonly options: { staleMs: number; feeds?: number; onUpdate?: (state: MarketState) => void; now?: () => number; url?: string }) {
+  constructor(readonly instrumentId: number, private readonly options: { staleMs: number; onUpdate?: (state: MarketState) => void; now?: () => number }) {
     this.now = options.now ?? Date.now;
-    // Redundant feeds over distinct egress routes: one proxy dropping its tunnel does not stale the book.
-    const feeds = Math.max(1, Math.min(options.feeds ?? 1, egress.size()));
-    this.sockets = Array.from({ length: feeds }, (_, index) => new ManagedSocket(`public${index + 1}`, egress, log, {
-      onOpen: async (socket) => {
-        const reply = await socket.request({ req: 'sub', chs: [`bbo::${instrumentId}`, `book::${instrumentId}`] });
-        if (Array.isArray(reply) && reply.some((item) => (item as { status?: string })?.status === 'err')) throw new Error(`subscription rejected: ${JSON.stringify(reply)}`);
-      },
-      onFrame: (frame) => this.onFrame(frame),
-      onState: (state, note) => log.info('public stream', { feed: index + 1, state, note }),
-    }, { url: options.url ?? WS_URL, routeOffset: index }));
   }
 
-  async seedFromRest(): Promise<void> {
-    const body = await this.rest.getPublic<{ instrument_id: number; bids: unknown; asks: unknown; timestamp: number; sequence: number }>('/v1/info/book', { instrument_id: this.instrumentId, depth: 100 });
+  async seedFromRest(rest: RestClient): Promise<void> {
+    const body = await rest.getPublic<{ instrument_id: number; bids: unknown; asks: unknown; timestamp: number; sequence: number }>('/v1/info/book', { instrument_id: this.instrumentId, depth: 100 });
     const bids = levels(body.bids, true), asks = levels(body.asks, false);
     if (!bids || !asks || body.instrument_id !== this.instrumentId) throw new Error('/v1/info/book: malformed book');
-    this.apply(bids, asks, body.timestamp, body.sequence, `${this.rest.base}/v1/info/book`);
+    this.apply(bids, asks, body.timestamp, body.sequence, `${rest.base}/v1/info/book`);
   }
 
-  start(): void { for (const socket of this.sockets) socket.start(); }
-  stop(): void { for (const socket of this.sockets) socket.stop(); }
-  connected(): boolean { return this.sockets.some((socket) => socket.isOpen()); }
-  routes(): string[] { return this.sockets.map((socket) => `${socket.name}:${socket.state}:${socket.route()}`); }
-
-  private onFrame(frame: Frame) {
+  ingest(frame: Frame): void {
     // `sq` is exchange-global: drop duplicates from the redundant feed and anything older, unless the book went stale
     // (a sequence reset upstream must not freeze the book forever).
     const fresh = this.receivedAt !== null && this.now() - this.receivedAt <= this.options.staleMs;
@@ -130,5 +113,51 @@ export class MarketData {
       worst = Math.max(worst, current.mid.minus(sample.mid).abs().div(sample.mid).mul(10_000).toNumber());
     }
     return worst;
+  }
+}
+
+/**
+ * Public market data for every quoted instrument over shared sockets. Redundant connections run over distinct egress
+ * routes so one proxy dropping its tunnel does not stale the books. Instruments can be added and removed at runtime;
+ * each (re)connect subscribes to the current set.
+ */
+export class PublicFeed {
+  private readonly books = new Map<number, MarketBook>();
+  private readonly sockets: ManagedSocket[];
+
+  constructor(egress: EgressPool, private readonly log: Logger, options: { feeds: number; url?: string }) {
+    const feeds = Math.max(1, Math.min(options.feeds, egress.size()));
+    this.sockets = Array.from({ length: feeds }, (_, index) => new ManagedSocket(`public${index + 1}`, egress, log, {
+      onOpen: async (socket) => { if (this.books.size) await this.subscribe(socket, [...this.books.keys()], 'sub'); },
+      onFrame: (frame) => {
+        const id = Number(frame.ch?.split('::')[1]);
+        if (Number.isSafeInteger(id)) this.books.get(id)?.ingest(frame);
+      },
+      onState: (state, note) => log.info('public stream', { feed: index + 1, state, note }),
+    }, { url: options.url ?? WS_URL, routeOffset: index }));
+  }
+
+  private async subscribe(socket: ManagedSocket, ids: number[], req: 'sub' | 'unsub'): Promise<void> {
+    const reply = await socket.request({ req, chs: ids.flatMap((id) => [`bbo::${id}`, `book::${id}`]) });
+    if (req === 'sub' && Array.isArray(reply) && reply.some((item) => (item as { status?: string })?.status === 'err')) throw new Error(`subscription rejected: ${JSON.stringify(reply)}`);
+  }
+
+  start(): void { for (const socket of this.sockets) socket.start(); }
+  stop(): void { for (const socket of this.sockets) socket.stop(); }
+  connected(): boolean { return this.sockets.some((socket) => socket.isOpen()); }
+  routes(): string[] { return this.sockets.map((socket) => `${socket.name}:${socket.state}:${socket.route()}`); }
+
+  /** Route frames for `book` and subscribe it on every open socket (closed ones subscribe on reconnect). */
+  async add(book: MarketBook): Promise<void> {
+    this.books.set(book.instrumentId, book);
+    await Promise.all(this.sockets.filter((s) => s.isOpen()).map((s) => this.subscribe(s, [book.instrumentId], 'sub').catch((error) => {
+      this.log.warn('subscribe failed; reconnecting feed', { feed: s.name, instrument: book.instrumentId, error: String(error) });
+      s.reconnect('subscribe failed');
+    })));
+  }
+
+  async remove(instrumentId: number): Promise<void> {
+    if (!this.books.delete(instrumentId)) return;
+    await Promise.all(this.sockets.filter((s) => s.isOpen()).map((s) => this.subscribe(s, [instrumentId], 'unsub').catch(() => undefined)));
   }
 }

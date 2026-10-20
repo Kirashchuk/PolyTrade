@@ -101,7 +101,7 @@ export class Metrics {
     this.log.info('metrics', line);
     try {
       await mkdir(this.options.dir, { recursive: true });
-      await appendFile(join(this.options.dir, `metrics-${this.options.mode}-${new Date(t).toISOString().slice(0, 10)}.jsonl`), JSON.stringify(line) + '\n');
+      await appendFile(join(this.options.dir, `metrics-${this.options.mode}-${this.instrument.symbol}-${new Date(t).toISOString().slice(0, 10)}.jsonl`), JSON.stringify(line) + '\n');
     } catch (error) { this.log.warn('metrics file write failed', { error: String(error) }); }
   }
 }

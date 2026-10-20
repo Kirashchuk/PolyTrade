@@ -7,11 +7,18 @@ import { silentLog } from './fixtures.ts';
 
 const TOKEN = 'f'.repeat(64);
 const fakeState = { now: 1, mode: 'dry_run', instrument: { id: 45, symbol: 'PLTR-USD', category: 'equity' }, status: 'running' } as unknown as DashboardState;
+const fakeSource = (stops: string[] = [], calls: string[] = []) => ({
+  dashboardState: (selected?: number) => { calls.push(`state:${selected ?? '-'}`); return fakeState; },
+  stop: async (reason: string) => { stops.push(reason); },
+  catalog: () => [{ id: 20, symbol: 'NVDA-USD', category: 'equity', closeOnly: false, settled: false, quoted: false }],
+  addInstrument: async (symbol: string) => { calls.push(`add:${symbol}`); if (symbol === 'BAD-USD') throw new Error('min_notional too high for http://FEEDUSER:FEEDPASS99@192.0.2.5:8080'); },
+  removeInstrument: async (symbol: string) => { calls.push(`remove:${symbol}`); },
+});
 function harness(port = 4320) {
-  const stops: string[] = [];
-  const handler = createDashboardHandler({ port: () => port, token: TOKEN, source: { dashboardState: () => fakeState, stop: async (reason) => { stops.push(reason); } }, alerts: () => [], assets: new Map([['/', '<html></html>']]) });
+  const stops: string[] = [], calls: string[] = [];
+  const handler = createDashboardHandler({ port: () => port, token: TOKEN, source: fakeSource(stops, calls), alerts: () => [], assets: new Map([['/', '<html></html>']]) });
   const call = (path: string, init: RequestInit & { headers?: Record<string, string> } = {}) => handler(new Request(`http://127.0.0.1:${port}${path}`, { ...init, headers: { host: `127.0.0.1:${port}`, ...init.headers } }));
-  return { call, stops };
+  return { call, stops, calls };
 }
 const stopInit = (headers: Record<string, string>, body = '{"confirm":true}'): RequestInit & { headers: Record<string, string> } => ({ method: 'POST', headers, body });
 
@@ -41,10 +48,42 @@ describe('dashboard guard', () => {
   });
 });
 
+describe('dashboard instrument selection', () => {
+  const post = (body: unknown, headers: Record<string, string> = { 'content-type': 'application/json', 'x-quoter-token': TOKEN }) => stopInit(headers, JSON.stringify(body));
+  test('state can be requested for a chosen instrument; the catalog lists choices', async () => {
+    const { call, calls } = harness();
+    await call('/api/state?instrument=20');
+    await call('/api/state');
+    expect(calls).toEqual(['state:20', 'state:-']);
+    const catalog = await (await call('/api/catalog')).json() as { symbol: string }[];
+    expect(catalog.map((c) => c.symbol)).toEqual(['NVDA-USD']);
+  });
+  test('adding or removing an instrument needs the token, JSON and confirmation', async () => {
+    const { call, calls } = harness();
+    expect((await call('/api/instruments', post({ action: 'add', symbol: 'NVDA-USD', confirm: true }, { 'content-type': 'application/json' }))).status).toBe(401);
+    expect((await call('/api/instruments', post({ action: 'add', symbol: 'NVDA-USD' }))).status).toBe(400);
+    expect((await call('/api/instruments', post({ action: 'add', symbol: 'NVDA USD; rm', confirm: true }))).status).toBe(400);
+    expect((await call('/api/instruments', post({ action: 'drop', symbol: 'NVDA-USD', confirm: true }))).status).toBe(400);
+    expect(calls).toEqual([]);
+    expect((await call('/api/instruments', post({ action: 'add', symbol: 'NVDA-USD', confirm: true }))).status).toBe(200);
+    expect((await call('/api/instruments', post({ action: 'remove', symbol: 'PLTR-USD', confirm: true }))).status).toBe(200);
+    expect(calls).toEqual(['add:NVDA-USD', 'remove:PLTR-USD']);
+  });
+  test('a refused add is reported as 409 with a redacted reason', async () => {
+    parseEgressList('x=192.0.2.5:8080:FEEDUSER:FEEDPASS99');
+    const { call } = harness();
+    const response = await call('/api/instruments', post({ action: 'add', symbol: 'BAD-USD', confirm: true }));
+    expect(response.status).toBe(409);
+    const body = await response.json() as { error: string };
+    expect(body.error).toContain('min_notional');
+    expect(body.error).not.toContain('FEEDPASS99');
+  });
+});
+
 describe('dashboard server', () => {
   test('binds to loopback, serves the page and a redacted event feed', async () => {
     parseEgressList('x=192.0.2.5:8080:FEEDUSER:FEEDPASS99');
-    const handle = await startDashboard({ port: 0, log: silentLog(), source: { dashboardState: () => fakeState, stop: async () => {} } });
+    const handle = await startDashboard({ port: 0, log: silentLog(), source: fakeSource() });
     try {
       expect(handle.url).toStartWith('http://127.0.0.1:');
       const page = await fetch(handle.url);

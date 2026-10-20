@@ -19,8 +19,10 @@ import { PLTR_ROW, silentLog } from './fixtures.ts';
 const KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d' as const;
 const signer = proxySigner(KEY);
 type MockOrder = { oid: number; iid: number; buy: boolean; p: string; qty: string; rest: string; fill: string; status: string; coid: string; tif: string; po: boolean };
+const NVDA_ROW = { ...PLTR_ROW, instrument_id: 20, symbol: 'NVDA-USD', base_asset: 'NVDA' };
 const exchange = {
   bid: '195.76', ask: '195.77', sq: 1_000, privateSq: 0, nextOid: 1,
+  books: { 20: { bid: '180.10', ask: '180.12' } } as Record<number, { bid: string; ask: string }>,
   orders: new Map<string, MockOrder>(), writes: [] as { type: string; args: unknown; sigOk: boolean }[],
   autoCancel: 0, sockets: new Set<ServerWebSocket<{ authed: boolean; channels: Set<string> }>>(),
 };
@@ -46,16 +48,16 @@ const server = Bun.serve<{ authed: boolean; channels: Set<string> }>({
     switch (key) {
       case 'GET /v1/info/time': return json({ time: Date.now() });
       case 'GET /v1/info/exchange': return json({ cancel_only: false });
-      case 'GET /v1/info/instruments': return json([PLTR_ROW]);
-      case 'GET /v1/info/book': return json({ instrument_id: 45, bids: [[exchange.bid, '10']], asks: [[exchange.ask, '10']], timestamp: Date.now(), sequence: exchange.sq });
+      case 'GET /v1/info/instruments': return json([PLTR_ROW, NVDA_ROW]);
+      case 'GET /v1/info/book': { const id = Number(url.searchParams.get('instrument_id')), b = bookOf(id); return json({ instrument_id: id, bids: [[b.bid, '10']], asks: [[b.ask, '10']], timestamp: Date.now(), sequence: exchange.sq }); }
       case 'GET /v1/account/limits': return json({ actions_per_minute: 0, actions_per_minute_limit: 5000, open_orders: 0, open_orders_limit: 1000 });
       case 'GET /v1/account/auto-cancel': return json({ deadline: exchange.autoCancel, triggered: 0, daily_limit: 10, next_reset: 0 });
-      case 'GET /v1/account/config': return json([{ instrument_id: 45, leverage: 5, cross: true }]);
+      case 'GET /v1/account/config': return json([{ instrument_id: Number(url.searchParams.get('instrument_id')), leverage: 5, cross: true }]);
       case 'GET /v1/account/portfolio': return json({ positions: [], margin: { total_account_value: '10000', available_order_margin: '9000' }, in_liquidation: false, timestamp: Date.now() });
       case 'GET /v1/account/stats': return json({ account_maker_share_7d: '0.012' });
       case 'GET /v1/account/rewards': return json({ data: [], more: false });
       case 'GET /v1/account/open-orders':
-        return json([...exchange.orders.values()].filter((o) => o.status === 'open').map((o) => ({ order_id: o.oid, instrument_id: o.iid, buy: o.buy, price: o.p, quantity: o.qty, resting_quantity: o.rest, filled_quantity: o.fill, status: o.status, client_order_id: o.coid, tif: 'gtc', post_only: true, ro: false })));
+        return json([...exchange.orders.values()].filter((o) => o.status === 'open' && (!url.searchParams.has('instrument_id') || o.iid === Number(url.searchParams.get('instrument_id')))).map((o) => ({ order_id: o.oid, instrument_id: o.iid, buy: o.buy, price: o.p, quantity: o.qty, resting_quantity: o.rest, filled_quantity: o.fill, status: o.status, client_order_id: o.coid, tif: 'gtc', post_only: true, ro: false })));
     }
     const body = await request.json() as { op: Operation; sig: Hex; salt: number; ts: number };
     const sigOk = await verify(body);
@@ -82,7 +84,7 @@ const server = Bun.serve<{ authed: boolean; channels: Set<string> }>({
         return { status: 'ok', oid: o.oid, coid, ts: Date.now() };
       }));
       case 'cancelAll':
-        for (const o of exchange.orders.values()) if (o.status === 'open') { o.status = 'cancelled'; o.rest = '0'; setTimeout(() => orderEvent(o), 5); }
+        for (const o of exchange.orders.values()) if (o.status === 'open' && (op.args.iid === undefined || o.iid === op.args.iid)) { o.status = 'cancelled'; o.rest = '0'; setTimeout(() => orderEvent(o), 5); }
         return json({ status: 'ok' });
       case 'autoCancel': exchange.autoCancel = op.args.time; return json({ status: 'ok', deadline: op.args.time });
       default: return json({ status: 'err', error: 'unsupported' }, 400);
@@ -103,26 +105,35 @@ const server = Bun.serve<{ authed: boolean; channels: Set<string> }>({
     },
   },
 });
-const ticker = setInterval(() => push('book::45', { b: [[exchange.bid, '10']], a: [[exchange.ask, '10']] }), 50);
+function bookOf(id: number) { return id === 45 ? { bid: exchange.bid, ask: exchange.ask } : exchange.books[id] ?? { bid: '1', ask: '2' }; }
+const ticker = setInterval(() => { for (const id of [45, 20]) { const b = bookOf(id); push(`book::${id}`, { b: [[b.bid, '10']], a: [[b.ask, '10']] }); } }, 50);
 afterAll(() => { clearInterval(ticker); server.stop(true); });
 
 const base = `http://127.0.0.1:${server.port}`;
 const until = async (check: () => boolean, ms = 8_000) => { const end = Date.now() + ms; while (!check()) { if (Date.now() > end) throw new Error('condition not reached'); await Bun.sleep(20); } };
 
+async function liveBot(rows: Record<string, unknown>[], tweak: (settings: ReturnType<typeof parseSettings>['settings']) => void = () => {}) {
+  const { settings } = parseSettings(Bun.YAML.parse(await Bun.file(new URL('../config/example.yaml', import.meta.url)).text()));
+  settings.mode = 'live';
+  settings.egress.allowDirect = true;
+  settings.metrics.dir = `${import.meta.dir}/.tmp-metrics-${Math.random().toString(36).slice(2)}`;
+  settings.sessions.schedule = 'regular';
+  tweak(settings);
+  const log = silentLog();
+  const egress = new EgressPool({ proxies: [], allowDirect: true, timeoutMs: 2_000, log });
+  const rest = new RestClient(egress, log, base);
+  const clock = new Clock(rest);
+  await clock.sync();
+  const credentials: Credentials = { auth: { proxy: signer.address, secret: 'mock-secret' }, signer, expiresAt: Date.now() + 86_400_000 * 2, owner: null, origin: 'environment' };
+  const bot = new QuoterBot({ settings, instruments: rows.map((row) => parseInstrument(row, base, Date.now())), egress, rest, clock, log, credentials, stopFile: `${import.meta.dir}/.no-stop-file`, selectionFile: null, wsUrl: `ws://127.0.0.1:${server.port}/v1/ws` });
+  const cleanup = () => import('node:fs/promises').then((fs) => fs.rm(settings.metrics.dir, { recursive: true, force: true }));
+  return { bot, cleanup };
+}
+const openOn = (iid: number) => [...exchange.orders.values()].filter((o) => o.status === 'open' && o.iid === iid);
+
 describe('live path against a local mock exchange', () => {
   test('arms the deadman, places a signed post-only ladder, modifies on a mid move, cancels and disarms on stop', async () => {
-    const { settings } = parseSettings(Bun.YAML.parse(await Bun.file(new URL('../config/example.yaml', import.meta.url)).text()));
-    settings.mode = 'live';
-    settings.egress.allowDirect = true;
-    settings.metrics.dir = `${import.meta.dir}/.tmp-metrics`;
-    settings.sessions.schedule = 'regular';
-    const log = silentLog();
-    const egress = new EgressPool({ proxies: [], allowDirect: true, timeoutMs: 2_000, log });
-    const rest = new RestClient(egress, log, base);
-    const clock = new Clock(rest);
-    await clock.sync();
-    const credentials: Credentials = { auth: { proxy: signer.address, secret: 'mock-secret' }, signer, expiresAt: Date.now() + 86_400_000 * 2, owner: null, origin: 'environment' };
-    const bot = new QuoterBot({ settings, instrument: parseInstrument(PLTR_ROW, base, Date.now()), egress, rest, clock, log, credentials, stopFile: `${import.meta.dir}/.no-stop-file`, wsUrl: `ws://127.0.0.1:${server.port}/v1/ws` });
+    const { bot, cleanup } = await liveBot([PLTR_ROW]);
     await bot.start();
     expect(exchange.autoCancel).toBeGreaterThan(Date.now());
 
@@ -132,10 +143,11 @@ describe('live path against a local mock exchange', () => {
     for (const o of exchange.orders.values()) { expect(o.tif).toBe('gtc'); expect(o.po).toBe(true); }
     const bids = [...exchange.orders.values()].filter((o) => o.buy).map((o) => o.p).sort();
     expect(bids).toEqual(['195.43', '195.6', '195.69']);
-    await until(() => bot.dashboardState().ladder.filter((row) => row.live?.status === 'open').length === 6);
+    await until(() => bot.dashboardState().selected!.ladder.filter((row) => row.live?.status === 'open').length === 6);
     const view = bot.dashboardState();
     expect(view.mode).toBe('live');
-    expect(view.ladder.filter((row) => row.live?.status === 'open')).toHaveLength(6);
+    expect(view.instruments.map((i) => i.symbol)).toEqual(['PLTR-USD']);
+    expect(view.selected!.ladder.filter((row) => row.live?.status === 'open')).toHaveLength(6);
     expect(view.account?.accountValue).toBe(10_000);
     expect(view.deadmanDeadline).toBeGreaterThan(Date.now());
     const serialized = JSON.stringify(view);
@@ -153,8 +165,41 @@ describe('live path against a local mock exchange', () => {
     expect(exchange.writes.some((w) => w.type === 'cancelAll')).toBe(true);
     expect(exchange.autoCancel).toBe(0); // disarmed after verified cancel
     expect(exchange.writes.every((w) => w.sigOk)).toBe(true);
-    await import('node:fs/promises').then((fs) => fs.rm(settings.metrics.dir, { recursive: true, force: true }));
+    await cleanup();
   }, 30_000);
+
+  test('quotes several instruments; one can be removed and re-added without touching the others', async () => {
+    exchange.orders.clear(); exchange.writes.length = 0; exchange.autoCancel = 0;
+    const { bot, cleanup } = await liveBot([PLTR_ROW, NVDA_ROW]);
+    await bot.start();
+    await until(() => openOn(45).length === 6 && openOn(20).length === 6);
+    const batches = exchange.writes.filter((w) => w.type === 'createOrders') as { args: { iid: number }[] }[];
+    expect(batches).toHaveLength(2); // one ladder batch per instrument
+    expect(new Set(batches.map((b) => b.args[0]!.iid))).toEqual(new Set([45, 20]));
+    expect(openOn(20).filter((o) => o.buy).map((o) => o.p).sort()).toEqual(['179.8', '179.96', '180.04']);
+    const view = bot.dashboardState(20);
+    expect(view.instruments.map((i) => i.symbol)).toEqual(['PLTR-USD', 'NVDA-USD']);
+    expect(view.selected!.instrument.symbol).toBe('NVDA-USD');
+    expect(bot.catalog().find((c) => c.symbol === 'NVDA-USD')!.quoted).toBe(true);
+
+    await bot.removeInstrument('NVDA');
+    expect(openOn(20)).toHaveLength(0);
+    expect(openOn(45)).toHaveLength(6);                              // the other book is untouched
+    expect(exchange.writes.filter((w) => w.type === 'cancelAll').map((w) => (w.args as { iid?: number }).iid)).toEqual([20]);
+    expect(exchange.autoCancel).toBeGreaterThan(Date.now());         // the account-wide timer keeps running
+    await expect(bot.removeInstrument('PLTR-USD')).rejects.toThrow('At least one instrument');
+
+    await bot.addInstrument('NVDA-USD');
+    await until(() => openOn(20).length === 6);
+    await expect(bot.addInstrument('nvda-usd')).rejects.toThrow('already quoted');
+    await expect(bot.addInstrument('DOGE-USD')).rejects.toThrow('not listed');
+
+    await bot.stop('test');
+    expect(openOn(45).length + openOn(20).length).toBe(0);
+    expect(exchange.autoCancel).toBe(0);
+    expect(exchange.writes.every((w) => w.sigOk)).toBe(true);
+    await cleanup();
+  }, 45_000);
 
   test('a refused startup leaves foreign orders and another session\'s auto-cancel deadline untouched', async () => {
     exchange.orders.clear(); exchange.writes.length = 0;
@@ -162,21 +207,12 @@ describe('live path against a local mock exchange', () => {
     exchange.autoCancel = foreignDeadline;
     const manual = 'd'.repeat(32);
     exchange.orders.set(manual, { oid: 999, iid: 45, buy: true, p: '190', qty: '1', rest: '1', fill: '0', status: 'open', coid: manual, tif: 'gtc', po: true });
-    const { settings } = parseSettings(Bun.YAML.parse(await Bun.file(new URL('../config/example.yaml', import.meta.url)).text()));
-    settings.mode = 'live'; settings.egress.allowDirect = true; settings.risk.startupCancelAll = false;
-    settings.metrics.dir = `${import.meta.dir}/.tmp-metrics-2`;
-    const log = silentLog();
-    const egress = new EgressPool({ proxies: [], allowDirect: true, timeoutMs: 2_000, log });
-    const rest = new RestClient(egress, log, base);
-    const clock = new Clock(rest);
-    await clock.sync();
-    const credentials: Credentials = { auth: { proxy: signer.address, secret: 'mock-secret' }, signer, expiresAt: Date.now() + 86_400_000 * 2, owner: null, origin: 'environment' };
-    const bot = new QuoterBot({ settings, instrument: parseInstrument(PLTR_ROW, base, Date.now()), egress, rest, clock, log, credentials, stopFile: `${import.meta.dir}/.no-stop-file`, wsUrl: `ws://127.0.0.1:${server.port}/v1/ws` });
+    const { bot, cleanup } = await liveBot([PLTR_ROW], (settings) => { settings.risk.startupCancelAll = false; });
     await expect(bot.start()).rejects.toThrow('not owned by this process');
     await bot.stop('startup failure');
     expect(exchange.writes).toHaveLength(0);              // no cancelAll, no autoCancel
     expect(exchange.orders.get(manual)!.status).toBe('open');
     expect(exchange.autoCancel).toBe(foreignDeadline);
-    await import('node:fs/promises').then((fs) => fs.rm(settings.metrics.dir, { recursive: true, force: true }));
+    await cleanup();
   }, 30_000);
 });

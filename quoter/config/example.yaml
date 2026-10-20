@@ -1,9 +1,21 @@
 # Polymarket Perps liquidity quoter. Copy to config/quoter.yaml (gitignored) and edit.
 # Spec: ../perps-quoter-architecture.md. Reward rules: https://docs.polymarket.com/perps/liquidity-rewards
 
-instrument: PLTR-USD        # symbol or numeric instrument_id from /v1/info/instruments
+# Instruments to quote: symbols (PLTR-USD or PLTR) or instrument ids from /v1/info/instruments.
+# Each one uses the defaults below (levels, inventory, leverage) unless it overrides them.
+# The dashboard can add or remove instruments at runtime; that choice is saved to data/selection.json
+# and restored at the next start (pass --from-config to use this list instead).
+instruments:
+  - PLTR-USD
+  - NVDA-USD
+  # - symbol: BTC-USD           # per-instrument override example
+  #   levels:
+  #     - {band: 1, bps: 3.0, size_usd: 2000}
+  #     - {band: 2, bps: 8.0, size_usd: 1000}
+  #   inventory: {max_position_usd: 10000}
+  #   leverage: 3
 mode: dry_run               # dry_run | live. Live also needs `run --live` on the command line.
-leverage: 5                 # set via PATCH /v1/trade/leverage at live startup; null keeps the exchange setting
+leverage: 5                 # default; set via PATCH /v1/trade/leverage at live startup; null keeps the exchange setting
 
 operator:
   # Where YOU physically operate the bot (ISO 3166-1 / 3166-2). Required for live mode.

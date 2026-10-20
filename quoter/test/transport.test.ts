@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { assertOrderPlacementAllowed } from '../src/compliance.ts';
-import { parseSettings } from '../src/config.ts';
+import { normalSymbol, parseSettings, profileFor } from '../src/config.ts';
 import { EgressPool, parseEgressList } from '../src/egress.ts';
 import { loadEnv } from '../src/env.ts';
 import { createLogger, redact } from '../src/log.ts';
@@ -90,5 +90,28 @@ describe('configuration', () => {
     await Bun.write(`${dir}/other.env`, 'FOO=1\n');
     expect(() => loadEnv(`${dir}/other.env`, {})).toThrow('unsupported key');
     await import('node:fs/promises').then((fs) => fs.rm(dir, { recursive: true, force: true }));
+  });
+});
+
+describe('instrument list', () => {
+  const levels = [{ band: 1, bps: 3.5, size_usd: 1000 }];
+  test('several instruments share the defaults unless an entry overrides them', () => {
+    const { settings } = parseSettings({
+      instruments: ['PLTR-USD', { symbol: 'BTC', levels: [{ band: 2, bps: 8, size_usd: 2000 }], inventory: { max_position_usd: 20_000 }, leverage: 3 }],
+      levels, leverage: 5, inventory: { max_position_usd: 5_000 },
+    });
+    expect(settings.instruments.map((i) => i.symbol)).toEqual(['PLTR-USD', 'BTC']);
+    expect(settings.instruments[0]).toMatchObject({ leverage: 5, inventory: { maxPositionUsd: 5_000 }, levels: [{ band: 1, bps: 3.5, sizeUsd: 1000 }] });
+    expect(settings.instruments[1]).toMatchObject({ leverage: 3, inventory: { maxPositionUsd: 20_000, skewBpsPer10k: 0.5 }, levels: [{ band: 2, bps: 8, sizeUsd: 2000 }] });
+    expect(profileFor(settings, 'BTC-USD').leverage).toBe(3);                // PLTR, pltr-usd and PLTR-USD name the same instrument
+    expect(profileFor(settings, 'NVDA-USD')).toMatchObject({ symbol: 'NVDA-USD', leverage: 5 }); // added from the dashboard: defaults
+    expect(normalSymbol('pltr')).toBe('PLTR-USD');
+  });
+  test('the legacy single instrument still works; duplicates and empty lists are refused', () => {
+    expect(parseSettings({ instrument: 'PLTR-USD', levels }).settings.instruments.map((i) => i.symbol)).toEqual(['PLTR-USD']);
+    expect(() => parseSettings({ instruments: ['PLTR', 'pltr-usd'], levels })).toThrow('listed twice');
+    expect(() => parseSettings({ instruments: [], levels })).toThrow('nonempty');
+    expect(() => parseSettings({ instrument: 'PLTR-USD', instruments: ['NVDA-USD'], levels })).toThrow('either');
+    expect(() => parseSettings({ instruments: [{ symbol: 'PLTR-USD', levels: [{ band: 1, bps: 6, size_usd: 1 }] }], levels })).toThrow('outside band 1');
   });
 });

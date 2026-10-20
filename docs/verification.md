@@ -58,7 +58,7 @@ Proxy credentials live only in the gitignored `quoter/.env`. Logs mask proxy use
 
 ## Automated checks
 
-`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **67 tests, 0 failures** (three consecutive runs).
+`bun run check` passed: root typecheck, 84 tests, production build, then `quoter` strict typecheck and **74 tests, 0 failures** (three consecutive runs).
 
 | Behavior | Evidence |
 |---|---|
@@ -93,6 +93,12 @@ An independent `/code-review` (xhigh) of `main...feature/perps-quoter` reported 
 - Tick moves use grid neighbours, so prices across a decade (999.99 → 1000.0) stay within 5 significant digits; off-grid prices or quantities are skipped.
 - Partial portfolio frames update only the fields present. The volatility breaker precedes any freeze, and a freeze longer than `max_freeze_s` pulls quotes.
 - The instrument poll matches by id. The daily-loss anchor persists across restarts. A resync requested during a reconcile survives it, and the private stream requests one after subscribing. The pull-path `cancelAll` is sent once and verified. Finished orders are pruned. Missing fees and PnL stay null. The mock-exchange test no longer races the `orders` event.
+
+## Multiple instruments — 20 October 2026
+
+The quoter now quotes any set of listed instruments from one process (`instruments:` in the config, or chosen in the dashboard). Account-wide pieces are shared: credentials, private stream, auto-cancel, action budget, daily-loss anchor and public sockets. Each instrument has its own book, orders, risk timers, metrics and cycle. The mock-exchange test quotes PLTR-USD and NVDA-USD together: one ladder batch per instrument, removing NVDA cancels only instrument 20 while PLTR's six orders and the account timer stay, re-adding works, and duplicates or unlisted symbols are refused. The dead man's switch is armed only after at least one instrument has taken ownership of its book; until then quotes stay paused, so a refused startup leaves another session's deadline untouched (mock test).
+
+Dashboard checks in the in-app browser during a dry-run (PLTR-USD + NVDA-USD): asset tabs with status, uptime and score; adding TSLA-USD from the exchange catalog (89 instruments) started it within about 6 s and saved the selection; removing it restored two tabs. The catalog no longer redraws on every poll, so a click cannot be lost, and the hidden add panel now stays hidden. At 375 px the page did not overflow. Endpoint tests cover the token, JSON, confirmation and symbol checks for add/remove, and a refused add returns 409 with a redacted reason.
 
 ## Limitations
 

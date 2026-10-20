@@ -1,12 +1,11 @@
 import { join, resolve } from 'node:path';
 import { QuoterBot } from './bot.ts';
 import { assertOrderPlacementAllowed } from './compliance.ts';
-import { loadSettings, type Settings } from './config.ts';
+import { loadSettings, profileFor, type Settings } from './config.ts';
 import { obtainCredentials, type Credentials } from './credentials.ts';
-import { D } from './decimal.ts';
 import { EgressPool, parseEgressList } from './egress.ts';
 import { loadEnv } from './env.ts';
-import { checkAgainstInstrument, findInstrument, type Instrument } from './instruments.ts';
+import { findInstrument, type Instrument } from './instruments.ts';
 import { createLogger, errorText, type Level, type Logger } from './log.ts';
 import { Clock, REST_BASE, RestClient, WS_URL } from './rest.ts';
 import { signOperation } from './signer.ts';
@@ -16,13 +15,16 @@ import { startDashboard, type DashboardHandle } from './dashboard/server.ts';
 const ROOT = resolve(import.meta.dir, '..');
 const USAGE = `Polymarket Perps liquidity quoter
 
-  bun src/main.ts probe                    egress routes, server time, instrument, public stream (read-only)
-  bun src/main.ts dry-run                  live public data, simulated ladder and reward metrics, no writes
-  bun src/main.ts status                   private account state for the instrument (read-only)
+  bun src/main.ts probe                    egress routes, server time, instruments, public stream (read-only)
+  bun src/main.ts dry-run                  live public data, simulated ladders and reward metrics, no writes
+  bun src/main.ts status                   private account state for the selected instruments (read-only)
   bun src/main.ts run --live               quote with real orders (config mode: live + jurisdiction gate)
-  bun src/main.ts cancel-all --live        cancel every open order on the instrument
+  bun src/main.ts cancel-all --live        cancel every open order on the selected instruments
 
-Options: --config <path> (default config/quoter.yaml, falling back to config/example.yaml)`;
+Options:
+  --config <path>        default config/quoter.yaml, falling back to config/example.yaml
+  --from-config          ignore the instrument selection saved from the dashboard (data/selection.json)
+  --instrument <symbol>  limit status / cancel-all to one instrument`;
 
 interface Context { env: Record<string, string | undefined>; settings: Settings; warnings: string[]; log: Logger; egress: EgressPool; rest: RestClient; clock: Clock; configPath: string; }
 
@@ -44,9 +46,26 @@ async function context(): Promise<Context> {
   return { env, settings, warnings, log, egress, rest, clock: new Clock(rest), configPath };
 }
 
-async function prepare(ctx: Context): Promise<Instrument> {
+interface Selection { instruments: Instrument[]; source: 'config' | 'dashboard'; }
+const selectionFile = (ctx: Context) => join(ctx.settings.metrics.dir, 'selection.json');
+
+/** Symbols to quote: the selection saved from the dashboard, unless --from-config or none was saved. */
+async function selectedSymbols(ctx: Context): Promise<{ symbols: string[]; source: 'config' | 'dashboard' }> {
+  const file = Bun.file(selectionFile(ctx));
+  if (!Bun.argv.includes('--from-config') && await file.exists()) {
+    try {
+      const saved = await file.json() as { instruments?: unknown };
+      if (Array.isArray(saved.instruments) && saved.instruments.length && saved.instruments.every((x) => typeof x === 'string')) {
+        ctx.log.info('instrument selection restored from the dashboard', { file: selectionFile(ctx), instruments: saved.instruments, hint: 'pass --from-config to use the config list' });
+        return { symbols: saved.instruments as string[], source: 'dashboard' };
+      }
+    } catch (error) { ctx.log.warn('saved instrument selection unreadable; using config', { error: errorText(error) }); }
+  }
+  return { symbols: ctx.settings.instruments.map((i) => i.symbol), source: 'config' };
+}
+
+async function prepare(ctx: Context): Promise<Selection> {
   const { log, settings, egress, rest, clock } = ctx;
-  log.info('config', { path: ctx.configPath, mode: settings.mode, instrument: settings.instrument, levels: settings.levels });
   for (const warning of ctx.warnings) log.warn('config', { warning });
   const probe = await egress.probe(REST_BASE, settings.egress.select === 'fastest');
   log.info('egress probe', { routes: probe, selected: egress.describe() });
@@ -54,14 +73,16 @@ async function prepare(ctx: Context): Promise<Instrument> {
   const sync = await clock.sync();
   log.info('clock', sync);
   const rows = await rest.getPublic<unknown[]>('/v1/info/instruments');
-  const instrument = findInstrument(rows, settings.instrument, `${REST_BASE}/v1/info/instruments`, clock.nowMs());
-  const book = await rest.getPublic<{ bids: [string, string][]; asks: [string, string][] }>('/v1/info/book', { instrument_id: instrument.id, depth: 10 });
-  const mid = book.bids[0] && book.asks[0] ? new D(book.bids[0][0]).plus(book.asks[0][0]).div(2) : null;
-  const check = checkAgainstInstrument(settings, instrument, mid);
-  log.info('instrument', { id: instrument.id, symbol: instrument.symbol, category: instrument.category, priceDecimals: instrument.priceDecimals, quantityDecimals: instrument.quantityDecimals, minNotional: instrument.minNotional.toFixed(), maxOrderCount: instrument.maxOrderCount, maxLeverage: instrument.maxLeverage, mid: mid?.toFixed() ?? null });
-  for (const warning of check.warnings) log.warn('instrument check', { warning });
-  if (check.errors.length) throw new Error(check.errors.join('; '));
-  return instrument;
+  const { symbols, source } = await selectedSymbols(ctx);
+  const only = argument('--instrument');
+  const instruments: Instrument[] = [];
+  for (const symbol of only ? [only] : symbols) {
+    try { instruments.push(findInstrument(rows, symbol, `${REST_BASE}/v1/info/instruments`, clock.nowMs())); }
+    catch (error) { log.error('instrument skipped', { symbol, error: errorText(error) }); }
+  }
+  if (!instruments.length) throw new Error(`None of the selected instruments is listed: ${symbols.join(', ')}`);
+  log.info('config', { path: ctx.configPath, mode: settings.mode, source, instruments: instruments.map((i) => ({ id: i.id, symbol: i.symbol, category: i.category, levels: profileFor(settings, i.symbol).levels })) });
+  return { instruments, source };
 }
 
 async function credentialsFor(ctx: Context): Promise<Credentials> {
@@ -70,8 +91,11 @@ async function credentialsFor(ctx: Context): Promise<Credentials> {
   return credentials;
 }
 
-async function runBot(ctx: Context, instrument: Instrument, credentials: Credentials | null): Promise<number> {
-  const bot = new QuoterBot({ settings: ctx.settings, instrument, egress: ctx.egress, rest: ctx.rest, clock: ctx.clock, log: ctx.log.child(credentials ? 'live' : 'dry'), credentials, stopFile: join(ROOT, 'STOP') });
+async function runBot(ctx: Context, selection: Selection, credentials: Credentials | null): Promise<number> {
+  const bot = new QuoterBot({
+    settings: ctx.settings, instruments: selection.instruments, egress: ctx.egress, rest: ctx.rest, clock: ctx.clock, log: ctx.log,
+    credentials, stopFile: join(ROOT, 'STOP'), selectionFile: selectionFile(ctx), selectionSource: selection.source,
+  });
   let dashboard: DashboardHandle | null = null;
   if (ctx.settings.dashboard.enabled) {
     try { dashboard = await startDashboard({ port: ctx.settings.dashboard.port, source: bot, log: ctx.log.child('dashboard') }); }
@@ -85,46 +109,54 @@ async function runBot(ctx: Context, instrument: Instrument, credentials: Credent
   const reason = await bot.done;
   await Bun.sleep(1_500); // let the panel show the final state
   dashboard?.stop();
-  ctx.log.info('stopped', { reason, metrics: bot.metrics.summary() });
+  ctx.log.info('stopped', { reason, metrics: bot.quoted().map((q) => q.metrics.summary()) });
   return reason.startsWith('risk halt') || reason === 'startup failure' ? 2 : 0;
 }
 
 async function probeCommand(ctx: Context): Promise<number> {
-  const instrument = await prepare(ctx);
+  const { instruments } = await prepare(ctx);
+  const waiting = new Set(instruments.map((i) => i.id));
   const socket = new ManagedSocket('probe', ctx.egress, ctx.log.child('probe'), {
-    onOpen: async (s) => { await s.request({ req: 'sub', chs: [`bbo::${instrument.id}`] }); },
-    onFrame: (frame) => { if (frame.ch === `bbo::${instrument.id}`) { ctx.log.info('public stream ok', { route: ctx.egress.describe(), url: WS_URL, bbo: frame.data, sq: frame.sq }); received = true; } },
+    onOpen: async (s) => { await s.request({ req: 'sub', chs: instruments.map((i) => `bbo::${i.id}`) }); },
+    onFrame: (frame) => {
+      const id = Number(frame.ch?.split('::')[1]);
+      if (frame.ch?.startsWith('bbo::') && waiting.delete(id)) ctx.log.info('public stream ok', { instrument: instruments.find((i) => i.id === id)?.symbol, route: ctx.egress.describe(), url: WS_URL, bbo: frame.data });
+    },
   }, { url: WS_URL });
-  let received = false;
   socket.start();
-  const until = Date.now() + 15_000;
-  while (!received && Date.now() < until) await Bun.sleep(100);
+  const until = Date.now() + 20_000;
+  while (waiting.size && Date.now() < until) await Bun.sleep(100);
   socket.stop();
-  if (!received) { ctx.log.error('no public stream frame within 15 s'); return 1; }
+  if (waiting.size) { ctx.log.error('no public stream frame within 20 s', { instruments: [...waiting] }); return 1; }
   return 0;
 }
 
 async function statusCommand(ctx: Context): Promise<number> {
-  const instrument = await prepare(ctx);
+  const { instruments } = await prepare(ctx);
   const credentials = await credentialsFor(ctx);
-  const auth = credentials.auth, q = { instrument_id: instrument.id };
-  const [open, portfolio, limits, autoCancel, stats] = await Promise.all([
-    ctx.rest.getPrivate<unknown[]>('/v1/account/open-orders', auth, q), ctx.rest.getPrivate<unknown>('/v1/account/portfolio', auth),
-    ctx.rest.getPrivate<unknown>('/v1/account/limits', auth), ctx.rest.getPrivate<unknown>('/v1/account/auto-cancel', auth), ctx.rest.getPrivate<unknown>('/v1/account/stats', auth),
+  const auth = credentials.auth;
+  const [portfolio, limits, autoCancel, stats] = await Promise.all([
+    ctx.rest.getPrivate<unknown>('/v1/account/portfolio', auth), ctx.rest.getPrivate<unknown>('/v1/account/limits', auth),
+    ctx.rest.getPrivate<unknown>('/v1/account/auto-cancel', auth), ctx.rest.getPrivate<unknown>('/v1/account/stats', auth),
   ]);
-  ctx.log.info('status', { instrument: instrument.symbol, openOrders: open, portfolio, limits, autoCancel, stats, credentialExpires: new Date(credentials.expiresAt).toISOString() });
+  const openOrders = Object.fromEntries(await Promise.all(instruments.map(async (i) => [i.symbol, await ctx.rest.getPrivate<unknown[]>('/v1/account/open-orders', auth, { instrument_id: i.id })] as const)));
+  ctx.log.info('status', { instruments: instruments.map((i) => i.symbol), openOrders, portfolio, limits, autoCancel, stats, credentialExpires: new Date(credentials.expiresAt).toISOString() });
   return 0;
 }
 
 async function cancelAllCommand(ctx: Context): Promise<number> {
-  const instrument = await prepare(ctx);
+  const { instruments } = await prepare(ctx);
   const credentials = await credentialsFor(ctx);
-  const request = await signOperation({ type: 'cancelAll', args: { iid: instrument.id } }, credentials.signer, ctx.clock.nowMs());
-  const outcome = await ctx.rest.write(request);
-  ctx.log.info('cancelAll', { instrument: instrument.symbol, ...outcome });
-  const open = await ctx.rest.getPrivate<unknown[]>('/v1/account/open-orders', credentials.auth, { instrument_id: instrument.id });
-  ctx.log.info('open orders after cancelAll', { count: Array.isArray(open) ? open.length : null });
-  return outcome.kind === 'ok' ? 0 : 1;
+  let failures = 0;
+  for (const instrument of instruments) {
+    const request = await signOperation({ type: 'cancelAll', args: { iid: instrument.id } }, credentials.signer, ctx.clock.nowMs());
+    const outcome = await ctx.rest.write(request);
+    ctx.log.info('cancelAll', { instrument: instrument.symbol, ...outcome });
+    const open = await ctx.rest.getPrivate<unknown[]>('/v1/account/open-orders', credentials.auth, { instrument_id: instrument.id });
+    ctx.log.info('open orders after cancelAll', { instrument: instrument.symbol, count: Array.isArray(open) ? open.length : null });
+    if (outcome.kind !== 'ok') failures++;
+  }
+  return failures ? 1 : 0;
 }
 
 async function main(): Promise<number> {
@@ -133,7 +165,7 @@ async function main(): Promise<number> {
   const ctx = await context();
   switch (command) {
     case 'probe': return probeCommand(ctx);
-    case 'dry-run': { const instrument = await prepare(ctx); return runBot(ctx, instrument, null); }
+    case 'dry-run': return runBot(ctx, await prepare(ctx), null);
     case 'status': return statusCommand(ctx);
     case 'cancel-all':
       if (!Bun.argv.includes('--live')) throw new Error('cancel-all sends a signed operation; pass --live to confirm');
@@ -141,8 +173,8 @@ async function main(): Promise<number> {
     case 'run': {
       if (!Bun.argv.includes('--live') || ctx.settings.mode !== 'live') throw new Error('Live quoting needs both `mode: live` in the config and the --live flag. Use dry-run otherwise.');
       assertOrderPlacementAllowed({ country: ctx.settings.operator.jurisdiction, region: ctx.settings.operator.region });
-      const instrument = await prepare(ctx);
-      return runBot(ctx, instrument, await credentialsFor(ctx));
+      const selection = await prepare(ctx);
+      return runBot(ctx, selection, await credentialsFor(ctx));
     }
     default: console.log(USAGE); return 1;
   }

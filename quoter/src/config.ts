@@ -3,8 +3,12 @@ import { BANDS, TIER_CAP_USD } from './rewards.ts';
 export interface LevelConfig { band: 1 | 2 | 3; bps: number; sizeUsd: number; }
 export interface SessionProfile { sizeMult: number; bpsAdd: number; }
 export type SessionName = 'regular' | 'overnight' | 'weekend';
+/** What a single instrument quotes with: global defaults, optionally overridden per instrument. */
+export interface QuoteProfile { levels: LevelConfig[]; inventory: Settings['inventory']; leverage: number | null; }
+export interface InstrumentConfig extends QuoteProfile { symbol: string; }
 export interface Settings {
-  instrument: string;
+  /** Instruments to quote at startup; the dashboard can add or remove more at runtime. */
+  instruments: InstrumentConfig[];
   mode: 'dry_run' | 'live';
   leverage: number | null;
   operator: { jurisdiction: string; region: string };
@@ -59,40 +63,26 @@ export interface ConfigReport { settings: Settings; warnings: string[]; }
 
 export function parseSettings(input: unknown): ConfigReport {
   const root = obj(input, 'config'), warnings: string[] = [];
-  unknownKeys(root, ['instrument', 'mode', 'leverage', 'operator', 'egress', 'credentials', 'levels', 'requote', 'inventory', 'risk', 'deadman', 'sessions', 'budget', 'metrics', 'dashboard'], 'config');
-  const instrument = root.instrument;
-  if ((typeof instrument !== 'string' || !instrument.trim()) && !(typeof instrument === 'number' && Number.isSafeInteger(instrument))) throw new Error('config.instrument: expected a symbol (e.g. PLTR-USD) or instrument id');
+  unknownKeys(root, ['instrument', 'instruments', 'mode', 'leverage', 'operator', 'egress', 'credentials', 'levels', 'requote', 'inventory', 'risk', 'deadman', 'sessions', 'budget', 'metrics', 'dashboard'], 'config');
 
   const operator = obj(root.operator, 'operator'), egress = obj(root.egress, 'egress'), credentials = obj(root.credentials, 'credentials');
   const requote = obj(root.requote, 'requote'), inventory = obj(root.inventory, 'inventory'), risk = obj(root.risk, 'risk');
   const vol = obj(risk.vol_breaker, 'risk.vol_breaker'), widen = obj(risk.post_only_reject_widen, 'risk.post_only_reject_widen');
   const deadman = obj(root.deadman, 'deadman'), sessions = obj(root.sessions, 'sessions'), budget = obj(root.budget, 'budget'), metrics = obj(root.metrics, 'metrics'), dashboard = obj(root.dashboard, 'dashboard');
 
-  if (!Array.isArray(root.levels) || !root.levels.length) throw new Error('config.levels: expected a nonempty list');
-  const levels = root.levels.map((raw, index): LevelConfig => {
-    const level = obj(raw, `levels[${index}]`), path = `levels[${index}]`;
-    unknownKeys(level, ['band', 'bps', 'size_usd'], path);
-    const band = num(level, 'band', path, undefined, 1, 3);
-    if (!Number.isInteger(band)) throw new Error(`${path}.band: expected 1, 2 or 3`);
-    const inner = band === 1 ? 0 : BANDS[band - 2]!.maxBps, outer = BANDS[band - 1]!.maxBps;
-    const bps = num(level, 'bps', path, undefined, 0, 100);
-    if (bps <= inner || bps >= outer) throw new Error(`${path}.bps: ${bps} is outside band ${band} (${inner}–${outer} bps, exclusive)`);
-    return { band: band as 1 | 2 | 3, bps, sizeUsd: num(level, 'size_usd', path, undefined, 1, 10_000_000) };
-  });
-  for (const band of [1, 2, 3] as const) {
-    const total = levels.filter((level) => level.band === band).reduce((sum, level) => sum + level.sizeUsd, 0);
-    if (total > TIER_CAP_USD) warnings.push(`Band ${band}: $${total} per side exceeds the $${TIER_CAP_USD} scoring cap; the excess uses margin without score`);
-  }
+  const levels = parseLevels(root.levels, 'levels', warnings);
 
   const profile = (name: SessionName, fallback: SessionProfile): SessionProfile => {
     const value = obj(sessions[name], `sessions.${name}`);
     return { sizeMult: num(value, 'size_mult', `sessions.${name}`, fallback.sizeMult, 0, 1), bpsAdd: num(value, 'bps_add', `sessions.${name}`, fallback.bpsAdd, 0, 15) };
   };
 
+  const defaultInventory = parseInventory(inventory, 'inventory', { maxPositionUsd: 5_000, skewBpsPer10k: 0.5, stopSideMode: 'zero' });
+  const defaultLeverage = root.leverage === undefined || root.leverage === null ? null : num(root, 'leverage', 'config', undefined, 1, 100);
   const settings: Settings = {
-    instrument: String(instrument).trim(),
+    instruments: parseInstruments(root, { levels, inventory: defaultInventory, leverage: defaultLeverage }, warnings),
     mode: str(root, 'mode', 'config', 'dry_run', ['dry_run', 'live'] as const),
-    leverage: root.leverage === undefined || root.leverage === null ? null : num(root, 'leverage', 'config', undefined, 1, 100),
+    leverage: defaultLeverage,
     operator: { jurisdiction: str(operator, 'jurisdiction', 'operator', ''), region: str(operator, 'region', 'operator', '') },
     egress: {
       select: str(egress, 'select', 'egress', 'fastest', ['fastest', 'ordered'] as const),
@@ -108,11 +98,7 @@ export function parseSettings(input: unknown): ConfigReport {
       refillRatio: num(requote, 'refill_ratio', 'requote', 0.5, 0, 1),
       minEdgeBps: num(requote, 'min_edge_bps', 'requote', 1, 0, 20),
     },
-    inventory: {
-      maxPositionUsd: num(inventory, 'max_position_usd', 'inventory', 5_000, 0, 100_000_000),
-      skewBpsPer10k: num(inventory, 'skew_bps_per_10k', 'inventory', 0.5, 0, 100),
-      stopSideMode: str(inventory, 'stop_side_mode', 'inventory', 'zero', ['zero', 'shrink'] as const),
-    },
+    inventory: defaultInventory,
     risk: {
       staleBookMs: num(risk, 'stale_book_ms', 'risk', 2_000, 200, 60_000),
       volBreaker: {
@@ -146,11 +132,79 @@ export function parseSettings(input: unknown): ConfigReport {
   };
   if (settings.deadman.rearmEveryS * 2 > settings.deadman.timeoutS) throw new Error('deadman.rearm_every_s must be at most half of deadman.timeout_s');
   if (settings.mode === 'live' && settings.risk.maxDailyLossUsd <= 0) warnings.push('risk.max_daily_loss_usd is 0: the daily loss stop is disabled');
-  for (const name of ['regular', 'overnight', 'weekend'] as const) for (const level of levels) {
+  for (const name of ['regular', 'overnight', 'weekend'] as const) for (const level of new Set([...levels, ...settings.instruments.flatMap((i) => i.levels)])) {
     const bps = level.bps + settings.sessions[name].bpsAdd;
     if (bps >= BANDS[level.band - 1]!.maxBps) warnings.push(`Session ${name}: level band ${level.band} at ${level.bps}+${settings.sessions[name].bpsAdd} bps leaves its band and will be clamped inside`);
   }
   return { settings, warnings };
+}
+
+function parseLevels(raw: unknown, path: string, warnings: string[]): LevelConfig[] {
+  if (!Array.isArray(raw) || !raw.length) throw new Error(`config.${path}: expected a nonempty list`);
+  const levels = raw.map((value, index): LevelConfig => {
+    const at = `${path}[${index}]`, level = obj(value, at);
+    unknownKeys(level, ['band', 'bps', 'size_usd'], at);
+    const band = num(level, 'band', at, undefined, 1, 3);
+    if (!Number.isInteger(band)) throw new Error(`${at}.band: expected 1, 2 or 3`);
+    const inner = band === 1 ? 0 : BANDS[band - 2]!.maxBps, outer = BANDS[band - 1]!.maxBps;
+    const bps = num(level, 'bps', at, undefined, 0, 100);
+    if (bps <= inner || bps >= outer) throw new Error(`${at}.bps: ${bps} is outside band ${band} (${inner}–${outer} bps, exclusive)`);
+    return { band: band as 1 | 2 | 3, bps, sizeUsd: num(level, 'size_usd', at, undefined, 1, 10_000_000) };
+  });
+  for (const band of [1, 2, 3] as const) {
+    const total = levels.filter((level) => level.band === band).reduce((sum, level) => sum + level.sizeUsd, 0);
+    if (total > TIER_CAP_USD) warnings.push(`${path}: band ${band} has $${total} per side, above the $${TIER_CAP_USD} scoring cap; the excess uses margin without score`);
+  }
+  return levels;
+}
+
+function parseInventory(o: Obj, path: string, fallback: Settings['inventory']): Settings['inventory'] {
+  unknownKeys(o, ['max_position_usd', 'skew_bps_per_10k', 'stop_side_mode'], path);
+  return {
+    maxPositionUsd: num(o, 'max_position_usd', path, fallback.maxPositionUsd, 0, 100_000_000),
+    skewBpsPer10k: num(o, 'skew_bps_per_10k', path, fallback.skewBpsPer10k, 0, 100),
+    stopSideMode: str(o, 'stop_side_mode', path, fallback.stopSideMode, ['zero', 'shrink'] as const),
+  };
+}
+
+function symbolOf(value: unknown, path: string): string {
+  if ((typeof value === 'string' && value.trim()) || (typeof value === 'number' && Number.isSafeInteger(value))) return String(value).trim();
+  throw new Error(`${path}: expected a symbol (e.g. PLTR-USD) or instrument id`);
+}
+
+/** `instruments` entries are a symbol or {symbol, levels?, inventory?, leverage?}; the legacy single `instrument` still works. */
+function parseInstruments(root: Obj, defaults: QuoteProfile, warnings: string[]): InstrumentConfig[] {
+  if (root.instrument !== undefined && root.instruments !== undefined) throw new Error('config: use either instrument or instruments, not both');
+  const raw = root.instruments ?? (root.instrument === undefined ? undefined : [root.instrument]);
+  if (!Array.isArray(raw) || !raw.length) throw new Error('config.instruments: expected a nonempty list of symbols, e.g. [PLTR-USD, NVDA-USD]');
+  const seen = new Set<string>();
+  return raw.map((entry, index) => {
+    const path = `instruments[${index}]`;
+    let resolved: InstrumentConfig;
+    if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
+      const o = entry as Obj;
+      unknownKeys(o, ['symbol', 'levels', 'inventory', 'leverage'], path);
+      resolved = {
+        symbol: symbolOf(o.symbol, `${path}.symbol`),
+        levels: o.levels === undefined ? defaults.levels : parseLevels(o.levels, `${path}.levels`, warnings),
+        inventory: o.inventory === undefined ? defaults.inventory : parseInventory(obj(o.inventory, `${path}.inventory`), `${path}.inventory`, defaults.inventory),
+        leverage: o.leverage === undefined ? defaults.leverage : o.leverage === null ? null : num(o, 'leverage', path, undefined, 1, 100),
+      };
+    } else resolved = { symbol: symbolOf(entry, path), ...defaults };
+    const key = normalSymbol(resolved.symbol);
+    if (seen.has(key)) throw new Error(`${path}: ${resolved.symbol} is listed twice`);
+    seen.add(key);
+    return resolved;
+  });
+}
+
+/** PLTR, pltr-usd and PLTR-USD name the same instrument. */
+export const normalSymbol = (symbol: string): string => { const s = symbol.trim().toUpperCase(); return /^\d+$/.test(s) || s.endsWith('-USD') ? s : `${s}-USD`; };
+
+/** Profile for a symbol: its config entry, or the global defaults for an instrument added from the dashboard. */
+export function profileFor(settings: Settings, symbol: string): InstrumentConfig {
+  const match = settings.instruments.find((i) => normalSymbol(i.symbol) === normalSymbol(symbol));
+  return match ? { ...match, symbol } : { symbol, levels: settings.levels, inventory: settings.inventory, leverage: settings.leverage };
 }
 
 export async function loadSettings(path: string): Promise<ConfigReport> {

@@ -27,13 +27,14 @@ export type RiskAction =
   /** Pull all quotes, resume automatically. */
   | { kind: 'pull'; reason: string }
   /** Pull all quotes and stop until a manual restart. */
-  | { kind: 'halt'; reason: string };
+  | { kind: 'halt'; reason: string; scope: 'account' | 'instrument' };
 
 /** Spec §9. Stateful only for timers (volatility pause, post-only widen windows, alerts). */
 export class RiskManager {
   private pausedUntil = 0;
   private widenUntil = new Map<SlotKey, number>();
   private haltReason: string | null = null;
+  private haltScope: 'account' | 'instrument' = 'account';
   private lastAlert = new Map<string, number>();
   private frozenSince: number | null = null;
 
@@ -43,12 +44,13 @@ export class RiskManager {
 
   evaluate(input: RiskInputs): RiskAction {
     const risk = this.settings.risk;
-    if (this.haltReason) return { kind: 'halt', reason: this.haltReason };
-    const halt = (reason: string): RiskAction => { this.haltReason = reason; this.alertOnce('halt', `HALT: ${reason}`, input.now, 0); return { kind: 'halt', reason }; };
+    if (this.haltReason) return { kind: 'halt', reason: this.haltReason, scope: this.haltScope };
+    // Account-wide halts stop the whole process; an instrument halt (settled, close-only) stops only that instrument.
+    const halt = (reason: string, scope: 'account' | 'instrument' = 'account'): RiskAction => { this.haltReason = reason; this.haltScope = scope; this.alertOnce('halt', `HALT: ${reason}`, input.now, 0); return { kind: 'halt', reason, scope }; };
 
     if (input.killSwitch) return halt('kill switch');
     if (input.inLiquidation) return halt('account in liquidation');
-    if (input.instrumentHalted) return halt(input.instrumentHalted);
+    if (input.instrumentHalted) return halt(input.instrumentHalted, 'instrument');
     if (input.dailyPnl !== null && risk.maxDailyLossUsd > 0 && input.dailyPnl < -risk.maxDailyLossUsd) return halt(`daily PnL ${input.dailyPnl.toFixed(2)} below -${risk.maxDailyLossUsd}`);
     if (input.proxyExpiresAt !== null && input.proxyExpiresAt - input.now < 86_400_000) this.alertOnce('proxy-expiry', `Polymarket proxy credential expires at ${new Date(input.proxyExpiresAt).toISOString()}`, input.now, 3_600_000);
     if (input.proxyExpiresAt !== null && input.proxyExpiresAt - input.now < this.settings.deadman.timeoutS * 2_000) return halt('Polymarket proxy credential about to expire');
@@ -56,6 +58,7 @@ export class RiskManager {
     if (!input.publicConnected || input.bookStatus !== 'live') return this.unfreeze({ kind: 'pull', reason: `market data ${input.publicConnected ? input.bookStatus : 'disconnected'}` });
     // Unprotected orders must not rest: two missed re-arms, or an expired deadline, pull everything.
     const rearmMs = this.settings.deadman.rearmEveryS * 1_000;
+    if (input.deadmanDeadline === 0) return this.unfreeze({ kind: 'pull', reason: "waiting for the dead man's switch" });
     if (input.deadmanDeadline !== null && input.deadmanDeadline - input.now < rearmMs) {
       this.alertOnce('deadman-health', "Dead man's switch deadline not renewed; quotes pulled until it is", input.now, 60_000);
       return this.unfreeze({ kind: 'pull', reason: "dead man's switch not confirmed" });

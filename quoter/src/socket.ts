@@ -46,6 +46,8 @@ export class ManagedSocket {
     this.setState('closed', 'stopped');
   }
   isOpen(): boolean { return this.socket?.readyState === WebSocket.OPEN; }
+  /** Drop the current connection; the normal reconnect path re-runs onOpen (resubscribe / re-auth). */
+  reconnect(reason: string): void { try { this.socket?.close(4002, reason.slice(0, 100)); } catch { /* already closing */ } }
   lastMessageAt(): number { return this.lastMessage; }
 
   send(payload: unknown): void {

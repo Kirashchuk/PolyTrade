@@ -24,7 +24,6 @@ export interface AccountSnapshot {
   availableMargin: number | null; accountValue: number | null; inLiquidation: boolean;
   portfolioAt: number | null;
 }
-export interface EquityAnchor { periodStart: number; value: number; }
 type Row = Record<string, unknown>;
 const row = (value: unknown): Row => value && typeof value === 'object' && !Array.isArray(value) ? value as Row : {};
 const money = (value: unknown): number | null => typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : null;
@@ -41,12 +40,8 @@ export class StateStore {
   private readonly seenFills = new Set<number>();
   private portfolioQty = new D(0);
   private account: Omit<AccountSnapshot, 'positionQty'> = { entryPrice: null, unrealizedPnl: null, availableMargin: null, accountValue: null, inLiquidation: false, portfolioAt: null };
-  private lastSequence: number | null = null;
-  private gapTimes: number[] = [];
-  private sequenceTrusted = true;
   private resyncReason: string | null = 'initial snapshot';
   readonly postOnlyRejects = new Map<SlotKey, number>();
-  private equityAnchor: EquityAnchor | null = null;
 
   constructor(readonly instrumentId: number, readonly symbol: string, private readonly now: () => number = Date.now) {}
 
@@ -174,25 +169,7 @@ export class StateStore {
     return unresolved;
   }
 
-  // ---------- sequencing ----------
-  /**
-   * Private frames carry `sq`. Official examples number them contiguously per connection across channels, so a jump
-   * past the highest value seen means a missed frame and the caller must resync from REST. If jumps turn out to be
-   * routine (more than 5 a minute), gap detection is disabled for the connection and the periodic reconcile remains.
-   */
-  checkSequence(channel: string, sq: unknown): boolean {
-    if (typeof sq !== 'number') return true;
-    const last = this.lastSequence;
-    this.lastSequence = last === null ? sq : Math.max(last, sq);
-    if (last === null || sq <= last + 1 || !this.sequenceTrusted) return true;
-    const t = this.now();
-    this.gapTimes = [...this.gapTimes.filter((time) => time > t - 60_000), t];
-    if (this.gapTimes.length > 5) { this.sequenceTrusted = false; this.onSequenceDistrust?.(); return true; }
-    this.markResync(`${channel} sequence gap ${last}→${sq}`);
-    return false;
-  }
-  onSequenceDistrust: (() => void) | null = null;
-  resetSequences(): void { this.lastSequence = null; this.gapTimes = []; this.sequenceTrusted = true; }
+  // ---------- resync ----------
   private resyncGen = 0;
   markResync(reason: string): void { this.resyncGen++; this.resyncReason ??= reason; }
   needsResync(): string | null { return this.resyncReason; }
@@ -218,17 +195,6 @@ export class StateStore {
   /** Own orders that rest outside their slot (a duplicate of a re-placed slot): to be cancelled. */
   strays(): OwnOrder[] { return this.activeOrders().filter((o) => this.slots.get(o.slot) !== o.coid); }
   ownLiveCount(): number { return this.liveCoids().length + this.strays().length; }
-
-  /** PnL since the start of the current reward period, from account value (no transfers are made by the bot). */
-  dailyPnl(periodStart: number): number | null {
-    const value = this.account.accountValue;
-    if (value === null) return null;
-    if (!this.equityAnchor || this.equityAnchor.periodStart !== periodStart) this.equityAnchor = { periodStart, value };
-    return value - this.equityAnchor.value;
-  }
-  anchor(): EquityAnchor | null { return this.equityAnchor; }
-  /** Restore the period anchor saved by an earlier process so a restart does not reset the daily-loss limit. */
-  restoreAnchor(anchor: EquityAnchor | null): void { if (anchor && Number.isFinite(anchor.value) && Number.isSafeInteger(anchor.periodStart)) this.equityAnchor = anchor; }
 
   /** Drop finished orders older than `maxAgeMs`; resting and in-flight orders are always kept. */
   prune(maxAgeMs = 600_000): void {

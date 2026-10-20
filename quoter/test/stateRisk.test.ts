@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { AccountStore, SequenceTracker } from '../src/account.ts';
 import { D } from '../src/decimal.ts';
 import { RiskManager, type RiskInputs } from '../src/risk.ts';
 import { StateStore } from '../src/state.ts';
@@ -19,29 +20,26 @@ describe('StateStore', () => {
     expect(state.liveCoids()).toEqual([]);
     expect(state.postOnlyRejects.get('bid:0')).toBe(1);
   });
-  test('private sequence gaps (contiguous per connection) require a resync; reconnect resets tracking', () => {
-    const state = new StateStore(45, 'PLTR-USD');
-    state.resynced();
-    expect(state.checkSequence('orders', 10)).toBe(true);
-    expect(state.checkSequence('fills', 11)).toBe(true);
-    expect(state.checkSequence('portfolio', 12)).toBe(true);
-    expect(state.checkSequence('orders', 12)).toBe(true); // duplicate / older: not a gap
-    expect(state.checkSequence('orders', 14)).toBe(false);
-    expect(state.needsResync()).toContain('gap');
-    state.resynced(); state.resetSequences();
-    expect(state.checkSequence('orders', 1)).toBe(true);
+  test('private sequence gaps (contiguous per connection) are reported; reconnect resets tracking', () => {
+    const seq = new SequenceTracker();
+    expect(seq.check('orders', 10)).toBeNull();
+    expect(seq.check('fills', 11)).toBeNull();
+    expect(seq.check('portfolio', 12)).toBeNull();
+    expect(seq.check('orders', 12)).toBeNull(); // duplicate / older: not a gap
+    expect(seq.check('orders', 14)).toContain('gap');
+    seq.reset();
+    expect(seq.check('orders', 1)).toBeNull();
   });
   test('routine sequence jumps disable gap-triggered resyncs instead of freezing the quoter', () => {
     let now = 0, distrusted = false;
-    const state = new StateStore(45, 'PLTR-USD', () => now);
-    state.onSequenceDistrust = () => { distrusted = true; };
-    state.checkSequence('orders', 0);
-    for (let i = 1; i <= 5; i++) { now += 1_000; expect(state.checkSequence('orders', i * 100)).toBe(false); state.resynced(); }
+    const seq = new SequenceTracker(() => now);
+    seq.onDistrust = () => { distrusted = true; };
+    seq.check('orders', 0);
+    for (let i = 1; i <= 5; i++) { now += 1_000; expect(seq.check('orders', i * 100)).toContain('gap'); }
     now += 1_000;
-    expect(state.checkSequence('orders', 900)).toBe(true);
+    expect(seq.check('orders', 900)).toBeNull();
     expect(distrusted).toBe(true);
-    expect(state.checkSequence('orders', 2_000)).toBe(true);
-    expect(state.needsResync()).toBeNull();
+    expect(seq.check('orders', 2_000)).toBeNull();
   });
   test('order events without a client id are matched by exchange order id', () => {
     const state = new StateStore(45, 'PLTR-USD');
@@ -67,9 +65,15 @@ describe('StateStore', () => {
     state.applyFills({ tid: 2, oid: 7, iid: 45, side: 'long', p: '195.7', qty: '0.5', ts: 1_100 });
     expect(state.snapshot().positionQty.toFixed()).toBe('-2');
     expect(state.snapshot().availableMargin).toBe(900);
-    expect(state.dailyPnl(0)).toBe(0);
-    state.applyPortfolio({ positions: [], margin: { available_order_margin: '900', total_account_value: '960' }, timestamp: 2_000 });
-    expect(state.dailyPnl(0)).toBe(-40);
+  });
+  test('account store: daily PnL from account value since the period start', () => {
+    const account = new AccountStore();
+    account.applyPortfolio({ positions: [], margin: { available_order_margin: '900', total_account_value: '1000' }, in_liquidation: false, timestamp: 1_000 });
+    expect(account.dailyPnl(0)).toBe(0);
+    account.applyPortfolio({ positions: [], margin: { available_order_margin: '900', total_account_value: '960' }, timestamp: 2_000 });
+    expect(account.dailyPnl(0)).toBe(-40);
+    account.applyPortfolio({ margin: { available_order_margin: '880' } });
+    expect(account.snapshot()).toMatchObject({ availableMargin: 880, accountValue: 960, inLiquidation: false });
   });
 });
 
@@ -188,10 +192,10 @@ describe('review regressions', () => {
   });
 
   test('restored equity anchor keeps the daily loss across restarts', () => {
-    const state = new StateStore(45, 'PLTR-USD');
-    state.restoreAnchor({ periodStart: 0, value: 1_000 });
-    state.applyPortfolio({ margin: { total_account_value: '700' } });
-    expect(state.dailyPnl(0)).toBe(-300);
+    const account = new AccountStore();
+    account.restoreAnchor({ periodStart: 0, value: 1_000 });
+    account.applyPortfolio({ margin: { total_account_value: '700' } });
+    expect(account.dailyPnl(0)).toBe(-300);
   });
 });
 

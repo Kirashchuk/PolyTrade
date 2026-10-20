@@ -1,4 +1,5 @@
-// Local quoter dashboard. Polls /api/state once a second; the only action is Stop (token-guarded POST).
+// Local quoter dashboard. Polls /api/state once a second for the selected instrument.
+// Actions (token-guarded POST): stop the process, add or remove an instrument.
 'use strict';
 
 const $ = (id) => document.getElementById(id);
@@ -7,7 +8,8 @@ const STATUS = { starting: 'запуск', running: 'котирує', paused: '�
 const BAND_LABEL = { 1: '0–5 bps', 2: '5–10 bps', 3: '10–20 bps' };
 const BAND_WEIGHT = { 1: '×1.00', 2: '×0.25', 3: '×0.10' };
 const CAP = 100000;
-let token = null, mode = null, failures = 0, stopping = false;
+let token = null, mode = null, failures = 0, stopping = false, selectedId = null, busy = false, catalog = [], quotedIds = new Set();
+try { const saved = Number(localStorage.getItem('quoter.selected')); if (Number.isSafeInteger(saved) && saved >= 0) selectedId = saved; } catch { /* storage unavailable */ }
 
 const fmt = (v, d = 2) => v === null || v === undefined || !Number.isFinite(Number(v)) ? '—' : Number(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 const usd = (v, d = 0) => v === null || v === undefined ? '—' : (Number(v) < 0 ? '−$' : '$') + fmt(Math.abs(Number(v)), d);
@@ -31,9 +33,22 @@ async function session() {
   token = (await response.json()).token;
 }
 
+async function control(path, body) {
+  if (!token) await session();
+  const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-quoter-token': token }, body: JSON.stringify({ ...body, confirm: true }) });
+  const reply = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(reply.error || String(response.status));
+  return reply;
+}
+
+function select(id) {
+  selectedId = id;
+  try { localStorage.setItem('quoter.selected', String(id)); } catch { /* storage unavailable */ }
+}
+
 async function poll() {
   try {
-    const response = await fetch('/api/state', { cache: 'no-store' });
+    const response = await fetch(selectedId === null ? '/api/state' : `/api/state?instrument=${selectedId}`, { cache: 'no-store' });
     if (!response.ok) throw new Error(String(response.status));
     const state = await response.json();
     failures = 0;
@@ -52,34 +67,118 @@ function offline() {
   const banner = $('banner');
   banner.hidden = false; banner.dataset.kind = 'offline';
   banner.textContent = stopping ? 'Процес зупинено. Панель більше не оновлюється.' : 'Немає зв’язку з процесом quoter. Перевірте термінал.';
-  $('stop').disabled = true;
+  $('stop').disabled = true; $('remove').disabled = true; $('add-toggle').disabled = true;
 }
 
 function render(s) {
   mode = s.mode;
-  document.title = `${s.instrument.symbol} · ${STATUS[s.status] ?? s.status} · Perps Quoter`;
-  $('symbol').textContent = s.instrument.symbol;
+  const d = s.selected;
+  if (d && selectedId !== d.instrument.id) select(d.instrument.id);
+  const quotedKey = s.instruments.map((i) => i.id).join(',');
+  const quotedChanged = quotedKey !== [...quotedIds].join(',');
+  quotedIds = new Set(s.instruments.map((i) => i.id));
+  document.title = `${d ? d.instrument.symbol + ' · ' : ''}${STATUS[s.status] ?? s.status} · Perps Quoter`;
   const m = $('mode'); m.dataset.mode = s.mode; m.textContent = s.mode === 'live' ? 'LIVE' : 'DRY-RUN';
-  const pill = $('status'); pill.dataset.state = s.status; pill.textContent = STATUS[s.status] ?? s.status;
-  $('reason').textContent = s.statusReason || (s.notes || []).join('; ');
+  const pill = $('status'); pill.dataset.state = s.status; pill.textContent = `${STATUS[s.status] ?? s.status} · ${s.instruments.length} акт.`;
+  $('reason').textContent = s.statusReason || (s.exchangeCancelOnly ? 'біржа в режимі cancel-only: нові ордери не приймаються' : '');
   $('route').textContent = s.egress.primary;
-  $('stop').disabled = stopping || s.status === 'stopping' || s.status === 'stopped';
+  const ended = stopping || s.status === 'stopping' || s.status === 'stopped';
+  $('stop').disabled = ended;
+  $('add-toggle').disabled = ended || busy;
   const banner = $('banner');
   banner.hidden = false; banner.dataset.kind = s.mode;
   banner.textContent = s.mode === 'live'
-    ? 'LIVE: реальні ордери на біржі. Зупинка знімає всі ордери на інструменті й вимикає autoCancel.'
+    ? 'LIVE: реальні ордери на біржі. «Зняти з котирування» скасовує ордери активу; «Зупинити все» знімає ордери всіх активів і вимикає autoCancel.'
     : 'DRY-RUN: симуляція на живих даних біржі. Ордери не надсилаються, позиції й PnL немає.';
-  renderKpis(s);
-  renderChart(s.history, s.now);
-  renderLadder(s);
-  renderBands(s.metrics);
+  renderAssets(s);
+  renderFailed(s.failed || []);
+  // Re-render the catalog only when the quoted set changes, so a click is never lost to a redraw.
+  if (!$('addpanel').hidden && quotedChanged) renderCatalog();
   renderAlerts(s.alerts || []);
-  renderSystem(s);
-  renderFills(s);
+  if (!d) { $('symbol').textContent = 'Немає активів'; $('remove').disabled = true; return; }
+  $('symbol').textContent = d.instrument.symbol;
+  const dp = $('detail-status'); dp.dataset.state = d.status; dp.textContent = STATUS[d.status] ?? d.status;
+  $('detail-reason').textContent = d.statusReason || (d.notes || []).join('; ');
+  $('remove').disabled = ended || busy || s.instruments.length < 2;
+  $('remove').title = s.instruments.length < 2 ? 'Останній актив не знімається: використайте «Зупинити все»' : '';
+  renderKpis(s, d);
+  renderChart(d.history, s.now);
+  renderLadder(d, s.mode);
+  renderBands(d.metrics);
+  renderSystem(s, d);
+  renderFills(d, s.mode);
 }
 
-function renderKpis(s) {
-  const mk = s.market, mt = s.metrics;
+function renderAssets(s) {
+  const root = $('assets'); root.replaceChildren();
+  const selected = s.selected?.instrument.id;
+  for (const a of s.instruments) {
+    const tab = el('button', { type: 'button', role: 'tab', class: 'asset', 'aria-selected': String(a.id === selected), 'data-state': a.status, title: a.statusReason || STATUS[a.status] || a.status },
+      el('span', { class: 'dot', 'aria-hidden': 'true' }),
+      el('span', { class: 'sym', text: a.symbol.replace(/-USD$/, '') }),
+      el('span', { class: 'meta', text: a.uptime === null ? (STATUS[a.status] ?? a.status) : `${fmt(a.uptime * 100, 0)}% · ${fmt(a.liquidityScore, 0)}` }));
+    tab.addEventListener('click', () => { select(a.id); void refreshNow(); });
+    root.append(tab);
+  }
+}
+
+function renderFailed(failed) {
+  const root = $('failed');
+  root.hidden = !failed.length; root.replaceChildren();
+  for (const f of failed.slice(0, 5)) root.append(el('div', { class: 'failed-row' }, el('strong', { text: f.symbol }), el('span', { text: ` не запущено: ${f.reason}` })));
+}
+
+async function refreshNow() {
+  try { const response = await fetch(`/api/state?instrument=${selectedId}`, { cache: 'no-store' }); if (response.ok) render(await response.json()); } catch { /* next poll */ }
+}
+
+async function loadCatalog() {
+  try { const response = await fetch('/api/catalog', { cache: 'no-store' }); if (response.ok) catalog = await response.json(); } catch { /* keep the last list */ }
+  renderCatalog();
+}
+
+function renderCatalog() {
+  const root = $('catalog'); root.replaceChildren();
+  const q = $('add-search').value.trim().toLowerCase();
+  const rows = catalog.filter((c) => !quotedIds.has(c.id) && (!q || c.symbol.toLowerCase().includes(q) || c.category.toLowerCase().includes(q)));
+  $('add-aside').textContent = `${rows.length} з ${catalog.length} доступних`;
+  if (!catalog.length) { root.append(el('p', { class: 'empty', text: 'Список інструментів ще завантажується…' })); return; }
+  if (!rows.length) { root.append(el('p', { class: 'empty', text: 'Нічого не знайдено' })); return; }
+  for (const c of rows.slice(0, 60)) {
+    const blocked = c.closeOnly || c.settled;
+    const item = el('button', { type: 'button', class: 'cat', title: blocked ? (c.settled ? 'settled' : 'close-only') : `Котирувати ${c.symbol}` },
+      el('span', { class: 'sym', text: c.symbol.replace(/-USD$/, '') }), el('span', { class: 'cat-k', text: blocked ? (c.settled ? 'settled' : 'close-only') : c.category }));
+    if (blocked || busy) item.setAttribute('disabled', '');
+    item.addEventListener('click', () => addInstrument(c));
+    root.append(item);
+  }
+}
+
+async function addInstrument(c) {
+  const question = mode === 'live'
+    ? `Почати котирувати ${c.symbol} РЕАЛЬНИМИ ордерами? Використовується сітка з конфігу (або налаштування за замовчуванням).`
+    : `Додати ${c.symbol} до симуляції?`;
+  if (!window.confirm(question)) return;
+  busy = true; $('add-note').textContent = `Запуск ${c.symbol}: перевірка інструмента, підписка на стакан…`; renderCatalog();
+  try {
+    await control('/api/instruments', { action: 'add', symbol: c.symbol });
+    select(c.id);
+    $('add-note').textContent = `${c.symbol} додано.`;
+    toggleAdd(false);
+  } catch (error) {
+    $('add-note').textContent = `Не вдалося додати ${c.symbol}: ${error.message}`;
+  } finally { busy = false; renderCatalog(); void refreshNow(); }
+}
+
+function toggleAdd(open) {
+  const panel = $('addpanel');
+  panel.hidden = !open;
+  $('add-toggle').setAttribute('aria-expanded', String(open));
+  if (open) { void loadCatalog(); $('add-search').focus(); }
+}
+
+function renderKpis(s, d) {
+  const mk = d.market, mt = d.metrics;
   text('k-mid', mk.mid ?? '—');
   $('k-mid-s').textContent = mk.mid ? `спред ${fmt(mk.spreadBps, 2)} bps · ${mk.ageMs === null ? '—' : ago(mk.ageMs)} · ${mk.status}` : mk.status;
   text('k-up', mt.samples ? `${fmt(mt.uptime * 100, 1)}%` : '—', mt.samples ? (mt.uptime >= 0.99 ? 'pos' : mt.uptime < 0.9 ? 'neg' : '') : '');
@@ -88,10 +187,10 @@ function renderKpis(s) {
   $('k-ls-s').textContent = `bid ${fmt(mt.sideScores?.bid, 0)} · ask ${fmt(mt.sideScores?.ask, 0)}`;
   text('k-raw', mt.estRawScore === null ? '—' : fmt(mt.estRawScore, 1));
   $('k-raw-s').textContent = mt.makerSharePct === null ? (s.mode === 'live' ? 'maker share ще не прочитано' : 'maker share невідомий у dry-run') : `maker share 7d ${fmt(mt.makerSharePct, 2)}%`;
-  const a = s.account;
-  if (a) {
-    text('k-pos', usd(a.positionUsd, 0), signClass(a.positionUsd));
-    $('k-pos-s').textContent = `${a.positionQty} · ліміт ${usd(s.limits.maxPositionUsd)}`;
+  const a = s.account, p = d.position;
+  if (a && p) {
+    text('k-pos', usd(p.usd, 0), signClass(p.usd));
+    $('k-pos-s').textContent = `${p.qty} · ліміт ${usd(d.limits.maxPositionUsd)}`;
     text('k-pnl', usd(a.dailyPnl, 2), signClass(a.dailyPnl));
     $('k-pnl-s').textContent = `стоп −${usd(s.limits.maxDailyLossUsd)} · маржа ${usd(a.availableMargin)}`;
   } else {
@@ -147,18 +246,19 @@ function renderChart(history, now) {
   $('strip-pct').textContent = cells.length ? `${fmt((ok / cells.length) * 100, 1)}% за ${fmt(cells.length / 60, 1)} хв` : '';
 }
 
-function stateTag(row, liveMode) {
-  if (!liveMode) return row.target ? el('span', { class: 'tag', text: 'симуляція' }) : el('span', { class: 'tag bad', text: 'пропущено' });
+function stateTag(row, liveMode, status) {
+  const held = status !== 'running' ? (STATUS[status] ?? status) : null;
+  if (!liveMode) return row.target ? el('span', { class: 'tag', text: 'симуляція' }) : el('span', { class: held ? 'tag wait' : 'tag bad', text: held ?? 'пропущено' });
   const live = row.live;
-  if (!live) return el('span', { class: row.target ? 'tag wait' : 'tag', text: row.target ? 'очікує' : '—' });
+  if (!live) return el('span', { class: row.target || held ? 'tag wait' : 'tag', text: row.target ? 'очікує' : held ?? '—' });
   if (live.inFlight) return el('span', { class: 'tag wait', text: 'в дорозі' });
   if (live.status === 'open' || live.status === 'accepted') return el('span', { class: 'tag ok', text: live.status === 'open' ? 'у книзі' : 'прийнято' });
   return el('span', { class: 'tag bad', text: live.status });
 }
 
-function renderLadder(s) {
+function renderLadder(s, runMode) {
   const body = $('ladder'); body.replaceChildren();
-  const liveMode = s.mode === 'live';
+  const liveMode = runMode === 'live';
   const rows = s.ladder.slice();
   const asks = rows.filter((r) => r.side === 'ask').sort((a, b) => b.level - a.level);
   const bids = rows.filter((r) => r.side === 'bid').sort((a, b) => a.level - b.level);
@@ -175,7 +275,7 @@ function renderLadder(s) {
       el('td', { class: `b${r.band}`, text: BAND_LABEL[r.band] }),
       priceCell, el('td', { class: 'r', text: qty }), el('td', { class: 'r', text: notional === undefined ? '—' : usd(notional) }),
       el('td', { class: 'r', text: dist === null || dist === undefined ? '—' : fmt(dist, 2) }),
-      el('td', {}, stateTag(r, liveMode)));
+      el('td', {}, stateTag(r, liveMode, s.status)));
   };
   for (const r of asks) body.append(line(r));
   body.append(el('tr', { class: 'midrow' }, el('td', { colspan: '7', text: s.market.mid ? `mid ${s.market.mid} · bid ${s.market.bid} / ask ${s.market.ask}` : 'немає ринкових даних' })));
@@ -209,39 +309,52 @@ function renderAlerts(alerts) {
   }
 }
 
-function renderSystem(s) {
+function renderSystem(s, d) {
   const root = $('system'); root.replaceChildren();
   const add = (k, v) => root.append(el('dt', { text: k }), el('dd', { text: v }));
-  add('Інструмент', `${s.instrument.symbol} · id ${s.instrument.id} · ${s.instrument.category}`);
-  add('Працює', span(s.now - s.startedAt));
+  add('Інструмент', `${d.instrument.symbol} · id ${d.instrument.id} · ${d.instrument.category}`);
+  add('Котирує', span(s.now - d.startedAt));
+  add('Процес працює', span(s.now - s.startedAt));
+  add('Вибір активів', s.selectionSource === 'dashboard' ? 'з панелі (data/selection.json)' : 'з конфігу');
   add('Публічні потоки', s.egress.feeds.join(' | ') || '—');
-  add('Дані', `${s.market.status} · ${s.market.ageMs === null ? '—' : ago(s.market.ageMs)}`);
+  add('Дані', `${d.market.status} · ${d.market.ageMs === null ? '—' : ago(d.market.ageMs)}`);
+  if (s.account) add('Маржа акаунта', `доступно ${usd(s.account.availableMargin)} · вартість ${usd(s.account.accountValue)}`);
   add('Dead man’s switch', s.deadmanDeadline ? `спрацює через ${span(s.deadmanDeadline - s.now)}, якщо процес зупиниться` : s.mode === 'live' ? 'не активний' : 'не потрібен у dry-run');
   if (s.credentialExpiresAt) add('Proxy-ключ', `спливає ${new Date(s.credentialExpiresAt).toLocaleString('uk-UA')}`);
-  add('Виконання', s.metrics.fills ? `${s.metrics.fills} · maker $${fmt(s.metrics.makerVolume, 0)} · комісії ${usd(s.metrics.fees, 2)}` : '0');
+  add('Виконання', d.metrics.fills ? `${d.metrics.fills} · maker $${fmt(d.metrics.makerVolume, 0)} · комісії ${usd(d.metrics.fees, 2)}` : '0');
 }
 
-function renderFills(s) {
+function renderFills(d, runMode) {
   const body = $('fills'); body.replaceChildren();
-  if (!s.fills.length) { body.append(el('tr', {}, el('td', { colspan: '5', class: 'empty', text: s.mode === 'live' ? 'Виконань ще не було' : 'У dry-run виконань немає' }))); return; }
-  for (const f of s.fills) body.append(el('tr', { class: f.side === 'long' ? 'bid' : 'ask' },
+  if (!d.fills.length) { body.append(el('tr', {}, el('td', { colspan: '5', class: 'empty', text: runMode === 'live' ? 'Виконань ще не було' : 'У dry-run виконань немає' }))); return; }
+  for (const f of d.fills) body.append(el('tr', { class: f.side === 'long' ? 'bid' : 'ask' },
     el('td', { text: time(f.t) }), el('td', { text: f.side === 'long' ? 'купівля' : 'продаж' }), el('td', { class: 'r', text: f.price }), el('td', { class: 'r', text: f.qty }), el('td', { class: 'r', text: usd(f.fee, 4) })));
 }
 
 $('stop').addEventListener('click', async () => {
   const question = mode === 'live'
-    ? 'Зупинити live-котирування? Буде виконано cancelAll на інструменті, перевірено відкриті ордери й вимкнено autoCancel. Позиція залишиться.'
+    ? 'Зупинити котирування всіх активів? Для кожного буде виконано cancelAll і перевірено відкриті ордери, потім вимкнено autoCancel. Позиції залишаться.'
     : 'Зупинити dry-run?';
   if (!window.confirm(question)) return;
   $('stop').disabled = true; stopping = true;
-  try {
-    if (!token) await session();
-    const response = await fetch('/api/stop', { method: 'POST', headers: { 'content-type': 'application/json', 'x-quoter-token': token }, body: JSON.stringify({ confirm: true }) });
-    if (!response.ok) throw new Error((await response.json()).error || String(response.status));
-  } catch (error) {
-    stopping = false; $('stop').disabled = false;
-    window.alert(`Не вдалося зупинити: ${error.message}`);
-  }
+  try { await control('/api/stop', {}); }
+  catch (error) { stopping = false; $('stop').disabled = false; window.alert(`Не вдалося зупинити: ${error.message}`); }
 });
+
+$('remove').addEventListener('click', async () => {
+  const symbol = $('symbol').textContent;
+  const question = mode === 'live'
+    ? `Зняти ${symbol} з котирування? Ордери цього активу буде скасовано й перевірено. Позиція залишиться.`
+    : `Прибрати ${symbol} із симуляції?`;
+  if (!window.confirm(question)) return;
+  busy = true; $('remove').disabled = true;
+  try { await control('/api/instruments', { action: 'remove', symbol }); select(null); }
+  catch (error) { window.alert(`Не вдалося зняти ${symbol}: ${error.message}`); }
+  finally { busy = false; void refreshNow(); }
+});
+
+$('add-toggle').addEventListener('click', () => toggleAdd($('addpanel').hidden));
+$('add-search').addEventListener('input', renderCatalog);
+$('add-search').addEventListener('keydown', (event) => { if (event.key === 'Escape') toggleAdd(false); });
 
 session().then(() => { $('stop').disabled = false; }).catch(() => {}).finally(poll);

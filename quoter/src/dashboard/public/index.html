@@ -13,7 +13,7 @@
       <span class="logo" aria-hidden="true">PQ</span>
       <div>
         <div class="eyebrow">Polymarket Perps · Liquidity Rewards</div>
-        <h1><span id="symbol">—</span><span class="mode" id="mode">…</span></h1>
+        <h1>Perps Quoter<span class="mode" id="mode">…</span></h1>
       </div>
     </div>
     <div class="status" aria-live="polite">
@@ -22,20 +22,44 @@
     </div>
     <div class="actions">
       <span class="route" id="route" title="Маршрут до API"></span>
-      <button id="stop" class="danger" type="button" disabled>Зупинити</button>
+      <button id="stop" class="danger" type="button" disabled>Зупинити все</button>
     </div>
   </header>
 
   <div class="banner" id="banner" hidden></div>
 
   <main>
+    <section class="assets-bar" aria-label="Активи">
+      <div class="assets" id="assets" role="tablist" aria-label="Активи, що котируються"></div>
+      <button id="add-toggle" class="ghost add-btn" type="button" aria-expanded="false" aria-controls="addpanel" disabled>+ Додати актив</button>
+    </section>
+    <section class="card addpanel" id="addpanel" hidden aria-label="Додати актив">
+      <div class="card-h">
+        <h2>Додати актив до котирування</h2>
+        <span class="aside" id="add-aside"></span>
+      </div>
+      <input id="add-search" type="search" placeholder="Пошук: NVDA, BTC, gold…" autocomplete="off" aria-label="Пошук активу">
+      <div class="catalog" id="catalog"></div>
+      <p class="note" id="add-note"></p>
+    </section>
+    <div class="failed" id="failed" hidden></div>
+
+    <section class="detail-h">
+      <div class="detail-title">
+        <h2 id="symbol">—</h2>
+        <span class="pill small" id="detail-status" data-state="starting"></span>
+        <span class="reason" id="detail-reason"></span>
+      </div>
+      <button id="remove" class="ghost" type="button" disabled>Зняти з котирування</button>
+    </section>
+
     <section class="kpis" aria-label="Ключові показники">
       <div class="kpi"><span class="k">Mid</span><span class="v" id="k-mid">—</span><span class="s" id="k-mid-s"></span></div>
       <div class="kpi"><span class="k">Uptime за період</span><span class="v" id="k-up">—</span><span class="s" id="k-up-s"></span></div>
       <div class="kpi"><span class="k">Liquidity score</span><span class="v" id="k-ls">—</span><span class="s" id="k-ls-s"></span></div>
       <div class="kpi"><span class="k">Оцінка raw score</span><span class="v" id="k-raw">—</span><span class="s" id="k-raw-s"></span></div>
       <div class="kpi"><span class="k">Позиція</span><span class="v" id="k-pos">—</span><span class="s" id="k-pos-s"></span></div>
-      <div class="kpi"><span class="k">PnL з 12:00 UTC</span><span class="v" id="k-pnl">—</span><span class="s" id="k-pnl-s"></span></div>
+      <div class="kpi"><span class="k">PnL акаунта з 12:00 UTC</span><span class="v" id="k-pnl">—</span><span class="s" id="k-pnl-s"></span></div>
     </section>
 
     <section class="row">
