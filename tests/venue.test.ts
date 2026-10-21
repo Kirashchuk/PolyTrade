@@ -142,6 +142,23 @@ describe('official tuple and history shapes', () => {
     expect((await client.trades(1)).data![0]).toEqual({ id: '8591207242945735', instrumentId: 1, side: 'short', price: 110, quantity: 0.005, timestamp: NOW });
   });
 
+  test('exchange clock offset is measured at the request midpoint and refused when the round trip is slow', async () => {
+    let now = NOW;
+    const clock = new VenueClient({ fetch: fake({ '/v1/info/time': () => { now += 400; return { time: NOW + 3_100 }; } }), now: () => now });
+    expect((await clock.clockOffset()).data).toBe(2_900);
+    now = NOW;
+    const slow = new VenueClient({ fetch: fake({ '/v1/info/time': () => { now += 2_500; return { time: NOW }; } }), now: () => now });
+    expect((await slow.clockOffset()).status).toBe('unavailable');
+  });
+
+  test('settlement fills are excluded from the public trade tape, as on the WebSocket', async () => {
+    const trade = (id: number, settlement?: unknown) => ({ trade_id: id, instrument_id: 1, side: 'long', price: '110', quantity: '1', timestamp: NOW, ...(settlement === undefined ? {} : { settlement }) });
+    const client = new VenueClient({ fetch: fake({ '/v1/info/trades': { data: [trade(1, false), trade(2, true), trade(3)], more: false } }), now: () => NOW });
+    expect((await client.trades(1)).data!.map((row) => row.id)).toEqual(['1', '3']);
+    const malformed = new VenueClient({ fetch: fake({ '/v1/info/trades': { data: [trade(4, 'yes')], more: false } }), now: () => NOW });
+    expect((await malformed.trades(1)).status).toBe('unavailable');
+  });
+
   test('leaderboard uses calendar window and source time; ROI is a fraction', async () => {
     const client = new VenueClient({ fetch: fake({ '/v1/info/leaderboard': {
       window: 'week', sort_by: 'roi', timestamp: NOW - 5_000, total: 4_000,

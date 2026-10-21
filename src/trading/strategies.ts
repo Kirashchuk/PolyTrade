@@ -13,7 +13,7 @@ export function planPaperOrders(config: BotConfig, market: Market, book: Book, s
   const half = roundGrid(new D(sliceQuantity).div(2), market.quantityDecimals);
   const mid = new D(book.bids[0]!.price).plus(book.asks[0]!.price).div(2);
   const spread = new D(config.spreadBps).div(20000);
-  const bid = roundGrid(D.min(new D(book.bids[0]!.price), mid.mul(new D(1).minus(spread))), market.priceDecimals);
-  const ask = roundGrid(D.max(new D(book.asks[0]!.price), mid.mul(spread.plus(1))), market.priceDecimals, true);
+  const bid = roundGrid(D.min(new D(book.bids[0]!.price), mid.mul(new D(1).minus(spread))), market.priceDecimals, false, true);
+  const ask = roundGrid(D.max(new D(book.asks[0]!.price), mid.mul(spread.plus(1))), market.priceDecimals, true, true);
   return [{...input('buy', half), price: bid}, {...input('sell', half), price: ask}];
 }

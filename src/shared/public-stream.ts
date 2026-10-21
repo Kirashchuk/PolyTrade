@@ -1,10 +1,11 @@
+import { exchangeNow } from './clock';
 import { VENUE_WS, type Book, type Trade } from './contracts';
 
 export interface StreamHandlers { onBook?: (book:Book)=>void; onTrades?: (trades:Trade[])=>void; onState?: (state:'connecting'|'live'|'reconnecting'|'closed',note:string)=>void; }
 type Frame = {ch?:string; ts?:number; ets?:number; sq?:number; data?:unknown; id?:number;};
 function positive(value:unknown):value is string {return typeof value==='string'&&/^\d+(\.\d+)?$/.test(value)&&Number.isFinite(Number(value))&&Number(value)>0;}
 /** The book channel provides the entire requested top-depth view, not incremental deltas. */
-export function parseStreamBook(frame:Frame,id:number,now=Date.now()):Book|null {
+export function parseStreamBook(frame:Frame,id:number,now=exchangeNow()):Book|null {
   if(!new RegExp(`^book::${id}(::(20|50))?$`).test(frame.ch??'')||!Number.isSafeInteger(frame.sq)||!Number.isFinite(frame.ets)||frame.ets!<=0||now-frame.ets!>=15_000||frame.ets!>now+1000)return null;
   const value=frame.data as {b?:unknown;a?:unknown}|undefined;
   if(!value||!Array.isArray(value.b)||!Array.isArray(value.a)||!value.b.length||!value.a.length)return null;

@@ -7,6 +7,7 @@ import { hashTypedData, keccak256, recoverTypedDataAddress, type EIP1193Provider
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Book, BotConfig, Market, OrderInput } from '../src/shared/contracts';
 import { estimateOrder, validateOrder } from '../src/trading/math';
+import { setExchangeClockOffset } from '../src/shared/clock';
 import { PaperEngine } from '../src/trading/paper';
 import { BotManager } from '../src/trading/bots';
 import { planPaperOrders } from '../src/trading/strategies';
@@ -55,6 +56,36 @@ describe('exact order validation and depth',()=>{
     expect(()=>validateOrder(order({type:'limit',price:'100',quantity:'0.1',leverage:10}),m,b,'0',TIME,{openOrders:[resting,{...resting,side:'sell'}]})).toThrow('open-order count');
     expect(()=>validateOrder(order(),market(),book(),'NaN',TIME)).toThrow('finite exact');
     expect(()=>validateOrder(order(),market(),book(),'Infinity',TIME)).toThrow('finite exact');
+  });
+});
+
+describe('exchange five-significant-figure order grid',()=>{
+  const high=(patch:Partial<Market>={})=>market({priceDecimals:1,quantityDecimals:6,markPrice:65162.5,...patch});
+  const highBook=book({bids:[{price:'65160',quantity:'2'}],asks:[{price:'65163',quantity:'2'}]});
+  test('computed IOC bounds use integer or five-significant-figure prices',()=>{
+    expect(validateOrder(order({quantity:'0.1',slippageBps:1}),high(),highBook,'0',TIME).limitPrice).toBe('65169');
+    expect(validateOrder(order({side:'sell',quantity:'0.1',slippageBps:1}),high(),highBook,'0',TIME).limitPrice).toBe('65154');
+    expect(validateOrder(order({quantity:'100',slippageBps:10}),market({priceDecimals:6,markPrice:0.12345}),book({bids:[{price:'0.1234',quantity:'1000'}],asks:[{price:'0.12345',quantity:'1000'}]}),'0',TIME).limitPrice).toBe('0.12357');
+  });
+  test('reviewed prices and quantities beyond five significant figures are refused before signing',()=>{
+    expect(()=>validateOrder(order({type:'limit',price:'65162.5',quantity:'0.1'}),high(),highBook,'0',TIME)).toThrow('significant');
+    expect(validateOrder(order({type:'limit',price:'65162',quantity:'0.1'}),high(),highBook,'0',TIME).limitPrice).toBe('65162');
+    expect(()=>validateOrder(order({quantity:'0.123456'}),high(),highBook,'0',TIME)).toThrow('significant');
+    expect(validateOrder(order({quantity:'0.12345'}),high(),highBook,'0',TIME).quantity).toBe('0.12345');
+  });
+  test('default freshness clock follows the measured exchange offset',()=>{
+    const at=Date.now()+2_900,observed={market:market({timestamp:at}),book:book({timestamp:at})};
+    try{
+      expect(()=>validateOrder(order(),observed.market,observed.book)).toThrow('stale');
+      setExchangeClockOffset(2_900);expect(validateOrder(order(),observed.market,observed.book).limitPrice).toBe('101');
+      setExchangeClockOffset(60_000);expect(()=>validateOrder(order(),observed.market,observed.book)).toThrow('stale');
+    }finally{setExchangeClockOffset(0);}
+  });
+  test('strategy quotes and slices are planned on the same grid',()=>{
+    const config:BotConfig={instrumentId:1,strategy:'maker',side:'buy',totalQuantity:'2',slices:1,intervalSeconds:5,spreadBps:20,leverage:2};
+    const [bid,ask]=planPaperOrders(config,high(),highBook,'2.4691356');
+    expect([bid!.price,ask!.price,bid!.quantity]).toEqual(['65096','65227','1.2345']);
+    expect(planPaperOrders({...config,strategy:'twap'},high(),highBook,'1.2345678')[0]!.quantity).toBe('1.2345');
   });
 });
 

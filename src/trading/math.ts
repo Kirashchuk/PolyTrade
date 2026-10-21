@@ -1,8 +1,11 @@
 import Decimal from 'decimal.js';
 import type { Book, Market, OrderInput } from '../shared/contracts';
+import { exchangeNow } from '../shared/clock';
 
 export const D = Decimal.clone({ precision: 50, rounding: Decimal.ROUND_DOWN });
 export const BOOK_MAX_AGE_MS = 15_000;
+/** Exchange order limit: at most five significant figures in price and quantity. Integer prices are exempt. */
+export const MAX_SIGNIFICANT = 5;
 export interface DepthFill { price: string; quantity: string; }
 export interface ExecutionQuote { limitPrice: string; filledQuantity: string; averagePrice: string | null; notional: string; unfilledQuantity: string; fills: DepthFill[]; slippageBps: number | null; }
 export interface ValidatedOrder { quantity: string; limitPrice: string; notional: string; maxLeverage: number; }
@@ -19,15 +22,21 @@ export function signedDecimal(value:unknown,name='Position quantity'):Decimal{
   if(typeof value!=='string'||value.length>100||! /^-?(0|[1-9]\d*)(\.\d+)?$/.test(value))throw new Error(`${name} must be a finite exact decimal string`);
   const result=new D(value);if(!result.isFinite())throw new Error(`${name} must be finite`);return result;
 }
-export function roundGrid(value: Decimal.Value, decimals: number, up = false): string {
+/** Rounds onto the order grid: `decimals` places and five significant figures (prices may instead be whole numbers). */
+export function roundGrid(value: Decimal.Value, decimals: number, up = false, price = false): string {
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) throw new Error('Invalid decimal precision');
-  return new D(value).toDecimalPlaces(decimals, up ? Decimal.ROUND_CEIL : Decimal.ROUND_FLOOR).toFixed();
+  const raw = new D(value), mode = up ? Decimal.ROUND_CEIL : Decimal.ROUND_FLOOR;
+  if (raw.lte(0)) return raw.toDecimalPlaces(decimals, mode).toFixed();
+  const figures = new D(10).pow(raw.e - (MAX_SIGNIFICANT - 1)), step = D.max(new D(10).pow(-decimals), price ? D.min(figures, 1) : figures);
+  // A carry rounds up to a power of ten, which lies on every coarser step.
+  return raw.div(step).toDecimalPlaces(0, mode).mul(step).toFixed();
 }
-function precision(value: string, places: number, name: string) {
-  decimal(value, name);
+function precision(value: string, places: number, name: string, price = false) {
+  const exact = decimal(value, name);
   if ((value.split('.')[1]?.length ?? 0) > places) throw new Error(`${name} exceeds ${places} decimal places`);
+  if (exact.sd(false) > MAX_SIGNIFICANT && !(price && exact.isInteger())) throw new Error(`${name} exceeds ${MAX_SIGNIFICANT} significant figures`);
 }
-export function validateBook(book: Book, instrumentId: number, now = Date.now()): void {
+export function validateBook(book: Book, instrumentId: number, now = exchangeNow()): void {
   if (book.instrumentId !== instrumentId || !Number.isFinite(book.timestamp) || now - book.timestamp >= BOOK_MAX_AGE_MS || book.timestamp > now + 1000) throw new Error('Order book is stale or belongs to another instrument');
   if (!Array.isArray(book.bids) || !Array.isArray(book.asks) || !book.bids.length || !book.asks.length) throw new Error('Order book is empty');
   for (const [levels, bid] of [[book.bids, true], [book.asks, false]] as const) {
@@ -52,7 +61,7 @@ export function leverageLimit(market: Market, positionNotional: Decimal.Value): 
   for (const tier of [...market.riskTiers].sort((a, b) => new D(a.lowerBound).cmp(b.lowerBound))) if (new D(positionNotional).gte(tier.lowerBound)) limit = Math.min(limit, tier.maxLeverage);
   return limit;
 }
-export function validateOrder(input: OrderInput, market: Market, book: Book, positionQuantity = '0', now = Date.now(), risk:OrderRiskContext={openOrders:[]}): ValidatedOrder {
+export function validateOrder(input: OrderInput, market: Market, book: Book, positionQuantity = '0', now = exchangeNow(), risk:OrderRiskContext={openOrders:[]}): ValidatedOrder {
   validateMetadata(market); validateBook(book, market.id, now);
   if(market.timestamp===null||!Number.isFinite(market.timestamp)||now-market.timestamp>=BOOK_MAX_AGE_MS||market.timestamp>now+1000)throw new Error('Instrument mark-price observation is stale or unavailable');
   if (input.instrumentId !== market.id || !['buy', 'sell'].includes(input.side) || !['market', 'limit'].includes(input.type) || typeof input.reduceOnly !== 'boolean' || typeof input.postOnly !== 'boolean') throw new Error('Invalid order fields');
@@ -70,13 +79,13 @@ export function validateOrder(input: OrderInput, market: Market, book: Book, pos
   let price: Decimal;
   if (input.type === 'limit') {
     if (!input.price) throw new Error('Limit price is required');
-    precision(input.price, market.priceDecimals, 'Price'); price = decimal(input.price, 'Price');
+    precision(input.price, market.priceDecimals, 'Price', true); price = decimal(input.price, 'Price');
     if (price.lt(low) || price.gt(high)) throw new Error('Limit price is outside instrument mark-price bounds');
     if (input.postOnly && (input.side === 'buy' ? price.gte(book.asks[0]!.price) : price.lte(book.bids[0]!.price))) throw new Error('Post-only order would cross the book');
   } else {
     const top = new D(input.side === 'buy' ? book.asks[0]!.price : book.bids[0]!.price), fraction = new D(input.slippageBps).div(10000);
     const raw = input.side === 'buy' ? D.min(top.mul(fraction.plus(1)), high) : D.max(top.mul(new D(1).minus(fraction)), low);
-    price = new D(roundGrid(raw, market.priceDecimals, input.side === 'sell'));
+    price = new D(roundGrid(raw, market.priceDecimals, input.side === 'sell', true));
     if (price.lte(0) || (input.side === 'buy' ? price.lt(top) : price.gt(top))) throw new Error('No liquidity within the instrument price bound');
   }
   const notional = price.mul(quantity), cap = input.type === 'market' ? market.maxMarketNotional : market.maxLimitNotional;
@@ -115,7 +124,7 @@ export function quoteDepth(input: Pick<OrderInput, 'side'|'quantity'>, book: Boo
   return { limitPrice, filledQuantity: filled.toFixed(), averagePrice: average?.toFixed() ?? null, notional: notional.toFixed(), unfilledQuantity: remaining.toFixed(), fills, slippageBps: average && top ? average.div(top).minus(1).mul(input.side === 'buy' ? 10000 : -10000).toNumber() : null };
 }
 
-export function estimateOrder(input: OrderInput, market: Market, book: Book, positionQuantity = '0', now = Date.now()): ExecutionQuote {
+export function estimateOrder(input: OrderInput, market: Market, book: Book, positionQuantity = '0', now = exchangeNow()): ExecutionQuote {
   const validated = validateOrder(input, market, book, positionQuantity, now);
   return quoteDepth(input, book, validated.limitPrice);
 }

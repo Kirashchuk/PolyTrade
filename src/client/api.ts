@@ -39,8 +39,8 @@ export function useSnapshot<T>(path: Accessor<string>, every = 15_000) {
 }
 
 let sessionToken: string | null = null;
-export async function session(): Promise<{ token: string; liveEnabled: boolean }> {
-  const value = await request<{ token: string; liveEnabled: boolean }>('/api/session');
+export async function session(): Promise<{ token: string; liveEnabled: boolean; liveOrigin: string }> {
+  const value = await request<{ token: string; liveEnabled: boolean; liveOrigin: string }>('/api/session');
   sessionToken = value.token;
   return value;
 }

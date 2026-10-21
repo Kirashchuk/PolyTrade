@@ -17,7 +17,7 @@ export interface FundingPoint { timestamp: number; rate: number; }
 export interface Overview { volume24h: number | null; openInterestUsd: number | null; fees24h: number | null; markets: number; volumeCoverage: number; oiCoverage: number; categories: {name: string; volume: number; markets: number}[]; exchange: {cancelOnly: boolean; version: string} | null; }
 export interface LeaderboardEntry { rank: number; account: string; pnl: number; notional: number; accountValue: number; roi: number | null; }
 export interface Leaderboard { window: string; sortBy: string; timestamp: number; total: number; entries: LeaderboardEntry[]; }
-export interface Health { now: number; liveEnabled: boolean; mode: 'local'; venue: string; database: string; }
+export interface Health { now: number; liveEnabled: boolean; mode: 'local'; venue: string; database: string; exchangeClockOffsetMs: number | null; }
 export interface OrderInput { instrumentId: number; side: 'buy'|'sell'; type: 'market'|'limit'; quantity: string; price?: string; leverage: number; reduceOnly: boolean; postOnly: boolean; slippageBps: number; clientOrderId: string; }
 export interface PaperOrder { id: string; input: OrderInput; status: 'open'|'filled'|'partial'|'cancelled'|'rejected'; filledQuantity: string; averagePrice: string | null; createdAt: number; reason: string | null; }
 export interface PaperPosition { instrumentId: number; symbol: string; quantity: string; entryPrice: string; markPrice: number | null; unrealizedPnl: number | null; leverage: number; }

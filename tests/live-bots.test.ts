@@ -7,7 +7,7 @@ const OWNER='0x'+'11'.repeat(20),TIME=1_800_000_000_000;
 const config:LiveBotConfig={instrumentId:1,strategy:'twap',side:'buy',totalQuantity:'2',slices:2,intervalSeconds:5,spreadBps:20,leverage:2,slippageBps:25,maxDurationSeconds:60};
 function fixture(){
   let now=TIME,deadline=0,held=false,authorized=true,storageFails=false,preexisting=false,stale=false,cancelOnly=false,triggered=0,dailyLimit=1000;
-  let pending:LiveSessionStatus['pending']=null,submitMode:'filled'|'partial'|'unknown'|'missing'|'throw'='filled',resolvePending=true,nextId=1;
+  let pending:LiveSessionStatus['pending']=null,submitMode:'filled'|'partial'|'unknown'|'missing'|'throw'='filled',resolvePending=true,nextId=1,skew=0,limitStatus='open';
   const values=new Map<string,string>(),calls:string[]=[],submitted:OrderInput[]=[],orders=new Map<string,Record<string,unknown>>();
   const storage={getItem:(key:string)=>values.get(key)??null,setItem:(key:string,value:string)=>{if(storageFails)throw new Error('Quota');values.set(key,value);}};
   const status=():LiveSessionStatus=>({owner:OWNER,proxy:'0x'+'22'.repeat(20),expiresAt:TIME+86_400_000,connected:true,authorized,blockedReason:null,pending,botControlled:held});
@@ -23,7 +23,7 @@ function fixture(){
       calls.push('submit');submitted.push(structuredClone(input));
       if(submitMode==='throw')throw new Error('Insufficient confirmed margin');
       const filled=input.type==='limit'?'0':submitMode==='partial'?'0.5':input.quantity,terminal=input.type==='market';
-      orders.set(input.clientOrderId,{order_id:nextId++,client_order_id:input.clientOrderId,instrument_id:input.instrumentId,buy:input.side==='buy',quantity:input.quantity,filled_quantity:filled,resting_quantity:terminal?'0':input.quantity,status:terminal?(submitMode==='partial'?'ioc_expired':'filled'):'open',updated_timestamp:now});
+      orders.set(input.clientOrderId,{order_id:nextId++,client_order_id:input.clientOrderId,instrument_id:input.instrumentId,buy:input.side==='buy',quantity:input.quantity,filled_quantity:filled,resting_quantity:terminal||limitStatus!=='open'?'0':input.quantity,status:terminal?(submitMode==='partial'?'ioc_expired':'filled'):limitStatus,updated_timestamp:now+skew});
       pending={owner:OWNER,action:'createOrders',clientOrderId:input.clientOrderId,orderId:null,submittedAt:now};
       if(submitMode==='unknown'){resolvePending=false;return {status:'unknown',message:'Lost mock acknowledgement'};}
       return {status:'accepted',message:'Mock order ACK, not a fill'};
@@ -40,7 +40,7 @@ function fixture(){
   const options={session,storage,now:()=>now,load:async()=>({market:market(),book:book(),cancelOnly})};
   const bot=createLiveBotManager(options);
   return {bot,port,options,storage,values,calls,submitted,orders,market,book,status,
-    setNow:(value:number)=>{now=value;},advance:(ms:number)=>{now+=ms;},setMode:(mode:typeof submitMode)=>{submitMode=mode;},setStale:(value:boolean)=>{stale=value;},setCancelOnly:(value:boolean)=>{cancelOnly=value;},setAuthorized:(value:boolean)=>{authorized=value;},setPreexisting:(value:boolean)=>{preexisting=value;},setQuota:(value:boolean)=>{storageFails=value;},setUsage:(count:number,limit:number)=>{triggered=count;dailyLimit=limit;},resolve:()=>{resolvePending=true;},getDeadline:()=>deadline};
+    setNow:(value:number)=>{now=value;},advance:(ms:number)=>{now+=ms;},setMode:(mode:typeof submitMode)=>{submitMode=mode;},setStale:(value:boolean)=>{stale=value;},setCancelOnly:(value:boolean)=>{cancelOnly=value;},setAuthorized:(value:boolean)=>{authorized=value;},setPreexisting:(value:boolean)=>{preexisting=value;},setQuota:(value:boolean)=>{storageFails=value;},setUsage:(count:number,limit:number)=>{triggered=count;dailyLimit=limit;},resolve:()=>{resolvePending=true;},getDeadline:()=>deadline,setSkew:(value:number)=>{skew=value;},setLimitStatus:(value:string)=>{limitStatus=value;}};
 }
 
 describe('real browser bot lifecycle with mocked exchange transport',()=>{
@@ -102,5 +102,16 @@ describe('real browser bot lifecycle with mocked exchange transport',()=>{
     const bot=createLiveBotManager({...f.options,load:async()=>{await wait;return {market:f.market(),book:f.book()};}});
     const start=bot.start(config,true),stopped=bot.stop();resume();await expect(start).rejects.toThrow('Stop requested');await stopped;
     expect(f.submitted).toHaveLength(0);expect(f.calls).not.toContain('arm');expect(f.status().botControlled).toBe(false);
+  });
+  test('exchange history timestamps are not compared with the browser clock',async()=>{
+    for(const skew of [2000,-500]){
+      const f=fixture();f.setSkew(skew);await f.bot.start(config,true);await f.bot.tick();
+      expect(f.bot.state()!.status).toBe('running');expect(f.bot.state()!.filledQuantity).toBe('1');await f.bot.stop();expect(f.bot.state()!.status).toBe('stopped');
+    }
+  });
+  test('documented post-only rejection is terminal; the maker keeps running and cleans up',async()=>{
+    const f=fixture();f.setLimitStatus('post_only_rejected');await f.bot.start({...config,strategy:'maker'},true);await f.bot.tick();
+    expect(f.bot.state()!.status).toBe('running');expect(f.bot.state()!.orders.every(order=>order.terminal&&order.status==='post_only_rejected')).toBe(true);
+    await f.bot.stop();expect(f.bot.state()!.status).toBe('stopped');expect(f.getDeadline()).toBe(0);expect(f.calls.some(call=>call.startsWith('cancel:'))).toBe(false);
   });
 });

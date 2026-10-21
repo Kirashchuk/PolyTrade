@@ -298,8 +298,10 @@ export class VenueClient {
     const path = `/v1/info/trades?instrument_id=${id}`;
     return this.cached(`trades:${id}`, 3_000, path, async () => {
       const row = object(await this.read(path), 'trades response');
-      const data = array(row.data, 'trades data').map((value): Trade => {
+      const data = array(row.data, 'trades data').flatMap((value): Trade[] => {
         const trade = object(value, 'trade');
+        // Settlement fills close positions at the final price; like the WebSocket tape, they are not market trades.
+        if (trade.settlement !== undefined && trade.settlement !== null && bool(trade.settlement, 'trade settlement')) return [];
         const iid = instrumentId(trade.instrument_id);
         if (iid !== id) throw new Error('Trade instrument does not match the request.');
         const side = text(trade.side, 'trade side');
@@ -307,7 +309,7 @@ export class VenueClient {
         const tradeId = typeof trade.trade_id === 'number' ? String(integer(trade.trade_id, 'trade ID')) : text(trade.trade_id, 'trade ID');
         const price = requiredMetric(trade.price, 'trade price'), quantity = requiredMetric(trade.quantity, 'trade quantity');
         if (price <= 0 || quantity <= 0) throw new Error('Malformed trade: price and quantity must be positive.');
-        return { id: tradeId, instrumentId: iid, side, price, quantity, timestamp: timestamp(trade.timestamp, 'trade timestamp') };
+        return [{ id: tradeId, instrumentId: iid, side, price, quantity, timestamp: timestamp(trade.timestamp, 'trade timestamp') }];
       });
       const more = bool(row.more, 'trades more');
       return { data, warning: more ? 'Recent trades are limited to the latest 100 entries; this is not complete exchange history.' : null };
@@ -344,6 +346,16 @@ export class VenueClient {
       return { data: { window, sortBy: sort, timestamp: at, total, entries }, observedAt: at,
         warning: `${entries.length} published rows of ${total} ranked accounts. Windows use calendar UTC boundaries. PnL excludes unrealized PnL; ROI is a decimal fraction.` };
     }, 180_000);
+  }
+
+  /** Exchange clock minus the local clock, from the official time endpoint at the request midpoint. */
+  clockOffset(): Promise<Snapshot<number>> {
+    const path = '/v1/info/time';
+    return this.cached('clock', 60_000, path, async () => {
+      const sent = this.now(), row = object(await this.read(path), 'exchange time'), received = this.now();
+      if (received - sent > 2_000) throw new Error('Exchange time round trip is too slow for a clock estimate.');
+      return { data: timestamp(row.time, 'exchange time') - Math.round((sent + received) / 2) };
+    });
   }
 
   exchange(): Promise<Snapshot<{ cancelOnly: boolean; version: string }>> {

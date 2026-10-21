@@ -46,7 +46,8 @@ function harness() {
   const state: {
     now:number;deadline:number;lostAck:boolean;applyBeforeLostAck:boolean;readDeadline:number|null;
     failRead:boolean;malformedRead:boolean;reject:boolean;waitRead:Promise<void>|null;onPortfolio:(()=>void)|null;
-  } = { now:TIME, deadline:0, lostAck:false, applyBeforeLostAck:false, readDeadline:null, failRead:false, malformedRead:false, reject:false, waitRead:null,onPortfolio:null };
+    exchangeSkew:number;orderStatus:string;lostOrderAck:boolean;
+  } = { now:TIME, deadline:0, lostAck:false, applyBeforeLostAck:false, readDeadline:null, failRead:false, malformedRead:false, reject:false, waitRead:null,onPortfolio:null,exchangeSkew:0,orderStatus:'filled',lostOrderAck:false };
   const fetcher = (async (input:RequestInfo|URL, init?:RequestInit) => {
     const path = new URL(String(input), 'http://localhost').searchParams.get('path')!, method = init?.method??'GET';
     const body = init?.body ? JSON.parse(String(init.body)) : null;
@@ -77,7 +78,8 @@ function harness() {
     }
     if(path==='/v1/trade/orders'&&method==='POST'){
       const wire=body.op.args[0],id=history.length+1;
-      history.push({order_id:id,client_order_id:wire.c,status:'filled',updated_timestamp:state.now});
+      history.push({order_id:id,client_order_id:wire.c,status:state.orderStatus,updated_timestamp:state.now+state.exchangeSkew});
+      if(state.lostOrderAck)throw new Error('Lost order response');
       return Response.json([{status:'ok',oid:id}]);
     }
     throw new Error(`Unexpected endpoint ${method} ${path}`);
@@ -240,5 +242,24 @@ describe('manual creation after live-bot recovery',()=>{
     await expect(h.live.submit(order(),market(),book(),true)).rejects.toThrow('cleanup first');
     expect(h.requests.some((request)=>request.path==='/v1/account/portfolio')).toBe(true);
     expect(h.requests.some((request)=>request.path==='/v1/trade/orders')).toBe(false);
+  });
+});
+
+describe('order reconciliation against exchange history',()=>{
+  test('a browser clock ahead of the exchange still resolves a lost create acknowledgement',async()=>{
+    const h=harness();await h.authorize();h.state.exchangeSkew=-500;h.state.lostOrderAck=true;
+    expect((await h.live.submit(order(),market(),book(),true)).status).toBe('unknown');expect(h.live.status().pending?.action).toBe('createOrders');
+    expect((await h.live.reconcile()).resolved).toBe(true);expect(h.live.status().pending).toBeNull();
+    expect(h.requests.filter((request)=>request.path==='/v1/trade/orders')).toHaveLength(1);
+  });
+
+  test('a documented post-only rejection is a terminal create outcome',async()=>{
+    const h=harness();await h.authorize();h.state.orderStatus='post_only_rejected';h.state.lostOrderAck=true;
+    const postOnly={...order(),type:'limit' as const,price:'99',postOnly:true};
+    expect((await h.live.submit(postOnly,market(),book(),true)).status).toBe('unknown');
+    expect((await h.live.reconcile()).resolved).toBe(true);
+    h.state.orderStatus='a_future_status';
+    expect((await h.live.submit(order(),market(),book(),true)).status).toBe('unknown');
+    expect((await h.live.reconcile()).resolved).toBe(false);
   });
 });

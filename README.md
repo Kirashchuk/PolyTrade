@@ -11,7 +11,7 @@ bun run check
 bun run start:live
 ```
 
-Open [PolyTrade](http://127.0.0.1:4310). The service binds only to `127.0.0.1`. `start:live` explicitly opts into the allow-listed live relay. Plain `bun start` leaves it disabled unless `POLYTRADE_LIVE_ENABLED=1` is already exported. Neither command connects a wallet, authorizes a proxy, places an order or starts a bot automatically. Market data needs network access.
+Open [PolyTrade](http://127.0.0.1:4310). The service binds only to `127.0.0.1`; `localhost` page addresses redirect there, and the live relay answers only that origin because browser locks and the live journal are per origin. `start:live` explicitly opts into the allow-listed live relay. Plain `bun start` leaves it disabled unless `POLYTRADE_LIVE_ENABLED=1` is already exported. Neither command connects a wallet, authorizes a proxy, places an order or starts a bot automatically. Market data needs network access.
 
 ## Screens
 
@@ -51,4 +51,4 @@ See [live-only specification](specs/002-live-only/spec.md), [architecture decisi
 
 Official [trading](https://docs.polymarket.com/perps/trading), [authenticated sessions](https://docs.polymarket.com/perps/authenticated-sessions), [OpenAPI](https://docs.polymarket.com/api-spec/perps-openapi.json), and [auto-cancel status](https://docs.polymarket.com/api-reference/get-auto-cancel-status) define the integration. Runtime data never falls back to the evidence captures in `artifacts/`.
 
-`bun run check` runs strict TypeScript, tests, the production build and the quoter check (strict TypeScript + tests). `bun run probe` reads public endpoints only. For UI development use `bun run dev` and `bun run dev:web` in separate terminals. No public deployment is included.
+`bun run check` runs strict TypeScript, tests, the production build and the quoter check (strict TypeScript + tests). `bun run probe` reads public endpoints only. For UI development use `bun run dev` and `bun run dev:web` in separate terminals; live trading is unavailable from the Vite origin. No public deployment is included.

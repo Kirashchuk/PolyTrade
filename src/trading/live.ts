@@ -32,8 +32,11 @@ export interface LiveBotControl {
 }
 export type LiveBotSession=LiveBotControl;
 export interface LiveAuditRow {timestamp:number;event:string;owner:string|null;pending:LivePending|null;}
-export interface LiveSessionOptions {provider:EIP1193Provider;token:string;fetcher?:typeof fetch;now?:()=>number;storage?:Pick<Storage,'getItem'|'setItem'>;withLock?:<T>(operation:()=>Promise<T>)=>Promise<T>;withBotLock?:<T>(operation:()=>Promise<T>)=>Promise<T>;}
+export interface LiveSessionOptions {provider:EIP1193Provider;token:string|(()=>string);fetcher?:typeof fetch;now?:()=>number;storage?:Pick<Storage,'getItem'|'setItem'>;withLock?:<T>(operation:()=>Promise<T>)=>Promise<T>;withBotLock?:<T>(operation:()=>Promise<T>)=>Promise<T>;}
 type Json = Record<string,unknown>;
+/** Documented order outcomes (docs.polymarket.com/perps/trading). An unlisted status stays unresolved. */
+export const ACTIVE_ORDER_STATUSES=new Set(['accepted','open','partial']);
+export const TERMINAL_ORDER_STATUSES=new Set(['filled','cancelled','canceled','rejected','expired','ioc_no_fill','ioc_expired','fok_unfilled','post_only_rejected','stp_cancelled','reduce_only_invalid','reduce_only_expired','sweep_cap_exceeded','resting_order_limit_exceeded','below_min_notional','instrument_disabled','instrument_close_only','instrument_settled','insufficient_margin_at_fill','mark_price_unavailable']);
 const jsonObject=(value:unknown):Json=>typeof value==='object'&&value!==null&&!Array.isArray(value)?value as Json:{};
 const errorMessage=(value:unknown,fallback:string)=>typeof jsonObject(value).error==='string'?jsonObject(value).error as string:fallback;
 const salt=()=>{const bytes=new Uint32Array(1);crypto.getRandomValues(bytes);return bytes[0]!;};
@@ -161,7 +164,7 @@ export function createLiveSession(options:LiveSessionOptions){
     return {owner,proxy,secret,expiresAt};
   };
   async function relay(path:string,method='GET',body?:unknown,privateRead=false):Promise<Response>{
-    const headers:Record<string,string>={'x-polytrade-token':options.token};
+    const headers:Record<string,string>={'x-polytrade-token':typeof options.token==='function'?options.token():options.token};
     if(body!==undefined)headers['Content-Type']='application/json';
     if(privateRead){const credential=credentials();headers['polymarket-proxy']=credential.proxy.address;headers['polymarket-secret']=credential.secret;}
     return fetcher(`/api/live?path=${encodeURIComponent(path)}`,{method,headers,...(body!==undefined?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(15_000),cache:'no-store'});
@@ -212,7 +215,8 @@ export function createLiveSession(options:LiveSessionOptions){
     try{
       await checkOwner();
       const response=await relay(`/v1/info/registered?address=${owner}`),registration:unknown=await response.json();
-      if(!response.ok||jsonObject(registration).registered!==true)throw new Error('This signer does not have a registered Polymarket Perps account. Use the official account setup first.');
+      if(!response.ok)throw new Error(errorMessage(registration,`Account registration check failed (${response.status})`));
+      if(jsonObject(registration).registered!==true)throw new Error('This signer does not have a registered Polymarket Perps account. Use the official account setup first.');
       const nextProxy=privateKeyToAccount(generatePrivateKey()),expiry=Math.floor(now()+ttlMinutes*60_000),requestSalt=salt(),timestamp=now();
       const typed=createProxyTypedData(nextProxy.address,expiry,requestSalt,timestamp);
       const sig=await wallet.signTypedData({...typed,account:owner});
@@ -284,7 +288,7 @@ export function createLiveSession(options:LiveSessionOptions){
       if(!input.reduceOnly&&availableMargin.lt(new D(valid.notional).div(input.leverage).plus(new D(valid.notional).mul('0.0004'))))throw new Error('Insufficient confirmed available order margin, including a default taker-fee buffer');
       if(!Array.isArray(account.orders))throw new Error('Open-order snapshot is incomplete');
       if(account.orders.map(jsonObject).some(order=>order.client_order_id===input.clientOrderId))throw new Error('Client order ID is already present in the live account');
-      const wire:WireOrder={iid:market.id,buy:input.side==='buy',p:valid.limitPrice,qty:input.quantity,tif:input.type==='market'?'ioc':'gtc',po:input.postOnly,ro:input.reduceOnly,c:input.clientOrderId};
+      const wire:WireOrder={iid:market.id,buy:input.side==='buy',p:valid.limitPrice,qty:valid.quantity,tif:input.type==='market'?'ioc':'gtc',po:input.postOnly,ro:input.reduceOnly,c:input.clientOrderId};
       if(manualCreate)requireManualBotCleanup();
       return await send({type:'createOrders',args:[wire]},'POST',{action:'createOrders',clientOrderId:input.clientOrderId,orderId:null});
     }finally{busy=false;}
@@ -321,9 +325,9 @@ export function createLiveSession(options:LiveSessionOptions){
         }else{
           const history=await readOrders(pending.orderId!==null?{orderId:pending.orderId}:{clientOrderId:pending.clientOrderId!}),rows=history.map(jsonObject);
           const row=rows.find(r=>pending!.orderId!==null?r.order_id===pending!.orderId:r.client_order_id===pending!.clientOrderId);
-          const known=['accepted','open','partial','filled','cancelled','canceled','rejected','ioc_no_fill','ioc_expired','stp_cancelled'];
-          const terminal=['filled','cancelled','canceled','rejected','ioc_no_fill','ioc_expired','stp_cancelled'];
-          if(row&&typeof row.status==='string'&&known.includes(row.status)&&Number(row.updated_timestamp)>=pending.submittedAt&&(pending.action!=='cancelOrders'||terminal.includes(row.status)))clearPending('order_reconciled');
+          // The exact order or random client ID identifies this intent; exchange and browser clocks are never compared.
+          const status=typeof row?.status==='string'?row.status:'';
+          if(TERMINAL_ORDER_STATUSES.has(status)||ACTIVE_ORDER_STATUSES.has(status)&&pending.action!=='cancelOrders')clearPending('order_reconciled');
         }
       }
       return {...account,resolved:pending===null,status:status(),...(autoCancel?{autoCancel}:{})};

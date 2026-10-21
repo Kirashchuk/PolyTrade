@@ -129,3 +129,32 @@ A read-only dry-run on real public data (PLTR-USD and TSLA-USD over two proxies,
 - Pause/stop use `cancelAll` on the quoted instrument, and `autoCancel` is account-wide, so manual orders on the account can be affected.
 - A create whose outcome stays unknown keeps its slot empty for up to 330 s if the exchange never reports the client id; order history may not list post-only rejections. During that time, removing the instrument or stopping reports an unverified cancel and leaves the auto-cancel deadline armed.
 - The `cancel-all` CLI path has no automated test (the module runs on import); its changes are covered only by typecheck.
+
+# Terminal review fixes — 20 October 2026
+
+`docs/terminal-code-review-2026-10-20-0966986.md` (9 findings on `0966986`; terminal `src` and `tests` unchanged since `120d167`) was re-checked against the current code. All nine reproduced and are fixed; one more defect was found and fixed during the re-check. Each fix has a regression test. All 17 new tests fail on the pre-fix sources (the trading and stream suites do not load there because the clock module is new; the three significant-figure tests had already failed individually before the clock test was added).
+
+- **Automation instrument (1).** A market refresh recreated the selector options. The selector then showed the first instrument while the launch configuration kept the previous ID. The selector is re-synchronized after every refresh, and the launch uses the displayed instrument (browser check below).
+- **One live origin (2).** `localhost`, `127.0.0.1` and the Vite port had separate Web Locks and live journals, so two tabs could control one account. The relay now answers only `http://127.0.0.1:<port>`, `/api/session` names that origin, and the client refuses to connect a wallet elsewhere. Page requests to `localhost:<port>` redirect there (`tests/server.test.ts`, `tests/live-state.test.ts`).
+- **Clock-free reconciliation (3).** A lost create acknowledgement stayed pending when the browser clock ran ahead of the exchange, and the bot halted when the exchange clock ran more than 1 s ahead. Reconciliation now relies on the exact order or random client ID and the order status. The bot compares exchange update times only with each other.
+- **Order outcomes (4).** Reconciliation and the bot share one list of documented outcomes: `post_only_rejected`, `fok_unfilled`, reduce-only, sweep-cap, resting-limit, minimum-notional, instrument and fill-time margin/mark outcomes. A post-only rejection no longer halts the maker or blocks cleanup. Unlisted statuses stay unresolved.
+- **Five significant figures (5).** IOC bounds, maker quotes and strategy slices round onto the exchange grid: price or quantity decimals and at most five significant figures, with integer prices exempt as the OpenAPI `price_decimals` description states. Reviewed prices and quantities outside the grid are refused before signing, and the signed quantity is the normalized exact string. On the real BTC-USD book the old IOC bound was `82891.3`; it is now `82891`.
+- **Stale metadata (6).** The manual review reads the market list again and requires a `live` snapshot, as the bot loader already did. Both use the same helper.
+- **Wallet change (7).** A private read started for the previous wallet is discarded after disconnect and connect, so another account's balance cannot appear under the new signer.
+- **Control token (8).** Every Connect fetches the current control token, so reconnecting after a service restart works. A failed registration check reports its actual error instead of "not registered".
+- **Settlement fills (9).** The REST tape drops `settlement: true` fills, as the WebSocket parser does. A non-boolean flag makes the snapshot unavailable.
+- **Exchange clock (additional).** Browser freshness checks compared exchange timestamps with the local clock and allowed 1 s of future skew. With the 2.9 s offset measured on 19 October, every book, mark and portfolio would have been stale and no live order possible. The service now measures the exchange offset from `/v1/info/time` (request midpoint, round trip at most 2 s, cached 60 s), `/api/health` reports it, and browser freshness, signing time, auto-cancel deadlines and bot checks use the corrected clock. Offsets beyond 30 s are ignored, so checks fail closed. Today's offset was +0.24 to +0.34 s.
+
+## Checks
+
+`bun run check` passed with Bun 1.3.14: strict TypeScript, **101 terminal tests with 568 assertions**, the production build (same non-blocking chunk hint) and the quoter typecheck with 88 tests.
+
+The browser check used a loopback server with the current server code, the live relay disabled, in-memory simulator stores and read-only public market data through the egress proxy (89 instruments). On the pre-fix build, GOLD-USD was selected in Automations; after the next market refresh the selector showed USA500-USD while the leverage limit stayed at GOLD-USD's 20×, so the launch ID was still GOLD-USD. On the fixed build, GOLD-USD and 20× held in four samples over 28 s of refreshes, and switching back to USA500-USD gave 50×. `http://localhost:<port>/#terminal` redirected to `127.0.0.1`. The terminal showed BTC-USD with the WebSocket book and 12 trade rows, and kept the selection after a refresh. Health reported a 339 ms clock offset. The console showed only the existing CSP block of the Google Fonts stylesheet. No wallet was connected and no signed request was sent.
+
+## Limitations
+
+- Live paths are verified with mocked transport only. No wallet signature, proxy registration or exchange write was made.
+- Live trading works only from `http://127.0.0.1:<port>`; the Vite dev origin cannot use the relay. Separate browsers or profiles on that origin still have separate locks and journals. The exchange-side checks remain the backstop there: a bot starts only with zero open orders and halts on untracked orders.
+- Quantities are always limited to five significant figures; only prices have the integer exemption, because the documentation states it only for prices.
+- The clock offset is measured through the service's own egress, so its error is up to half the round trip. Server-side cache freshness still uses the local clock with its 5 s tolerance.
+- The CSP blocks the Google Fonts `@import` in `styles.css`, so the UI uses fallback fonts. This predates the review and is unchanged.

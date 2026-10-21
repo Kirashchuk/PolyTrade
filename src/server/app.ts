@@ -1,6 +1,6 @@
 import { resolve, extname, sep, dirname } from 'node:path';
 import type { Book, BotConfig, Market, OrderInput } from '../shared/contracts';
-import { HttpError, localHost, readJson, requireControl, type GuardConfig } from './guard';
+import { HttpError, liveOrigin, localHost, readJson, requireControl, requireLiveOrigin, type GuardConfig } from './guard';
 import { relay } from './relay';
 import { VenueClient } from './venue';
 import { PaperEngine } from '../trading/paper';
@@ -40,11 +40,15 @@ export function createApp(options: AppOptions) {
     if(!count||now-count.start>10_000)counts.set(key,{start:now,count:1});
     else if(++count.count>150)throw new HttpError(429,'Local request budget exceeded');
     if(counts.size>256)counts.clear();
-    if(key==='/api/session' && request.method==='GET')return json({token:options.token,liveEnabled:options.liveEnabled});
-    if(key==='/api/live'){requireControl(request,guard);return relay(request,options.liveEnabled);}
+    if(key==='/api/session' && request.method==='GET')return json({token:options.token,liveEnabled:options.liveEnabled,liveOrigin:liveOrigin(guard)});
+    if(key==='/api/live'){requireControl(request,guard);requireLiveOrigin(request,guard);return relay(request,options.liveEnabled);}
     if(!['GET','HEAD'].includes(request.method))requireControl(request,guard);
     if(request.method==='GET') {
-      if(key==='/api/health')return json({now,liveEnabled:options.liveEnabled,mode:'local',venue:'Polymarket Perps',database:'Browser live journal · credentials in memory',tickError});
+      if(key==='/api/health'){
+        // A slow clock read never delays health; the cached estimate is used on the next poll.
+        const clock=await Promise.race([venue.clockOffset().then(snapshot=>snapshot.data),new Promise<null>(done=>setTimeout(done,1_500,null))]);
+        return json({now,liveEnabled:options.liveEnabled,mode:'local',venue:'Polymarket Perps',database:'Browser live journal · credentials in memory',tickError,exchangeClockOffsetMs:clock});
+      }
       if(key==='/api/markets')return json(await venue.markets());
       if(key==='/api/overview')return json(await venue.overview());
       if(key==='/api/fees')return json(await venue.fees());
@@ -89,6 +93,7 @@ export function createApp(options: AppOptions) {
       const url=new URL(request.url);
       if(url.pathname.startsWith('/api/'))response=await handleApi(request,url);
       else if(!['GET','HEAD'].includes(request.method))response=json({error:'Method not allowed'},405);
+      else if([`localhost:${options.port}`,`[::1]:${options.port}`].includes(request.headers.get('host')?.toLowerCase()??''))response=new Response(null,{status:308,headers:{location:liveOrigin(guard)+url.pathname+url.search}});
       else {
         let decoded:string;try{decoded=decodeURIComponent(url.pathname);}catch{throw new HttpError(400,'Invalid path');}
         const target=resolve(dist,'.'+decoded);

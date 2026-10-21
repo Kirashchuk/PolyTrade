@@ -1,6 +1,6 @@
 import type { Book, BotConfig, Market, OrderInput } from '../shared/contracts';
 import type { LiveAccount, LiveOutcome, LiveSessionStatus } from './live';
-import { livePositionQuantity } from './live';
+import { ACTIVE_ORDER_STATUSES as ACTIVE, TERMINAL_ORDER_STATUSES as TERMINAL, livePositionQuantity } from './live';
 import { D, decimal, roundGrid, signedDecimal, validateBook, validateMetadata, validateOrder } from './math';
 import { planPaperOrders } from './strategies';
 
@@ -32,8 +32,6 @@ export interface LiveBotOptions {
   storage?:Pick<Storage,'getItem'|'setItem'>;now?:()=>number;
 }
 const KEY='polytrade.live-bot.v1',DEADMAN_MS=60_000,RENEW_MS=15_000,RENEW_EARLY_MS=10_000,MIN_HEADROOM_MS=15_000,MAX_ORDERS=1000;
-const TERMINAL=new Set(['filled','cancelled','canceled','rejected','ioc_no_fill','ioc_expired','stp_cancelled','expired']);
-const ACTIVE=new Set(['accepted','open','partial']);
 const object=(value:unknown):Record<string,unknown>=>typeof value==='object'&&value!==null&&!Array.isArray(value)?value as Record<string,unknown>:{};
 const message=(error:unknown)=>error instanceof Error?error.message:'Live strategy safety check failed';
 
@@ -103,11 +101,12 @@ export function createLiveBotManager(options:LiveBotOptions){
       const result=await control.readOrders({clientOrderId:order.clientOrderId}),rows=Array.isArray(result)?result:[];
       const row=rows.map(object).find(value=>value.client_order_id===order.clientOrderId||(order.orderId!==null&&value.order_id===order.orderId));
       if(!row)throw new Error(`Accepted / uncertain order ${order.clientOrderId} is absent from order history. Scheduling halted.`);
-      if(row.instrument_id!==current.config.instrumentId||row.buy!==(order.side==='buy')||row.client_order_id!==order.clientOrderId||!signedDecimal(row.quantity,'Exchange order quantity').eq(order.quantity)||!Number.isSafeInteger(row.order_id)||Number(row.order_id)<0||typeof row.status!=='string'||(!ACTIVE.has(row.status)&&!TERMINAL.has(row.status))||typeof row.updated_timestamp!=='number'||!Number.isFinite(row.updated_timestamp)||row.updated_timestamp<order.submittedAt||row.updated_timestamp>now()+1000)throw new Error('Owned order history is incomplete, mismatched or stale');
+      // Exchange update times are compared only with each other, never with the browser clock.
+      if(row.instrument_id!==current.config.instrumentId||row.buy!==(order.side==='buy')||row.client_order_id!==order.clientOrderId||!signedDecimal(row.quantity,'Exchange order quantity').eq(order.quantity)||!Number.isSafeInteger(row.order_id)||Number(row.order_id)<0||typeof row.status!=='string'||(!ACTIVE.has(row.status)&&!TERMINAL.has(row.status))||typeof row.updated_timestamp!=='number'||!Number.isFinite(row.updated_timestamp)||order.updatedAt!==null&&row.updated_timestamp<order.updatedAt)throw new Error('Owned order history is incomplete, mismatched or stale');
       const filled=signedDecimal(row.filled_quantity,'Exchange filled quantity');
       if(filled.lt(order.filledQuantity)||filled.gt(order.quantity)||filled.lt(0))throw new Error('Exchange cumulative fill quantity is inconsistent');
       const resting=signedDecimal(row.resting_quantity,'Exchange resting quantity');
-      if(resting.lt(0)||resting.gt(new D(order.quantity).minus(filled))||TERMINAL.has(row.status)&&!resting.isZero()||row.status==='filled'&&!filled.eq(order.quantity)||['rejected','ioc_no_fill'].includes(row.status)&&!filled.isZero())throw new Error('Exchange order status, filled quantity and resting quantity are inconsistent');
+      if(resting.lt(0)||resting.gt(new D(order.quantity).minus(filled))||TERMINAL.has(row.status)&&!resting.isZero()||row.status==='filled'&&!filled.eq(order.quantity)||['rejected','ioc_no_fill','fok_unfilled','post_only_rejected'].includes(row.status)&&!filled.isZero())throw new Error('Exchange order status, filled quantity and resting quantity are inconsistent');
       const delta=filled.minus(order.filledQuantity);order.orderId=row.order_id as number;
       if(delta.gt(0)){current.fills.push({clientOrderId:order.clientOrderId,orderId:order.orderId,quantity:delta.toFixed(),observedAt:now()});current.fills=current.fills.slice(-MAX_ORDERS);}
       order.filledQuantity=filled.toFixed();order.status=row.status;order.terminal=TERMINAL.has(row.status);order.updatedAt=row.updated_timestamp;

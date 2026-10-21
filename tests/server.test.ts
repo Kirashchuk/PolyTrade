@@ -24,6 +24,7 @@ function harness(options: { staleBook?: boolean; cancelOnly?: boolean } = {}) {
       '/v1/info/statistics': [{ instrument_id: 6, volume: '1000000', open_price: '99', klines: [] }],
       '/v1/info/book': { instrument_id: 6, bids: [['99.0', '50.00']], asks: [['101.0', '50.00']], timestamp: options.staleBook ? now - 60_000 : now, sequence: 1 },
       '/v1/info/exchange': { cancel_only: options.cancelOnly ?? false, version: '1' },
+      '/v1/info/time': { time: now + 2_900 },
     };
     if (!(url.pathname in payloads)) throw new Error(`Unexpected venue request ${url.pathname}`);
     return Response.json(payloads[url.pathname]);
@@ -66,6 +67,24 @@ describe('loopback API integration', () => {
     expect((await app.fetch(request('/api/session', 'GET', undefined, { origin: 'https://attacker.example', 'sec-fetch-site': 'cross-site' }))).status).toBe(403);
     const trusted = await app.fetch(request('/api/session'));
     expect((await trusted.json()).token).toBe(TOKEN);
+  });
+
+  test('health reports the measured exchange clock offset for browser freshness checks', async () => {
+    const { app } = harness();
+    expect((await (await app.fetch(request('/api/health'))).json()).exchangeClockOffsetMs).toBe(2_900);
+  });
+
+  test('live relay and wallet bootstrap have one canonical browser origin', async () => {
+    const { app, calls } = harness();
+    expect((await (await app.fetch(request('/api/session'))).json()).liveOrigin).toBe(ORIGIN);
+    const alias = { host: `localhost:${PORT}`, origin: `http://localhost:${PORT}`, 'x-polytrade-token': TOKEN };
+    const live = await app.fetch(request('/api/live?path=%2Fv1%2Finfo%2Ftime', 'GET', undefined, alias));
+    expect(live.status).toBe(403);
+    expect((await live.json()).error).toContain(ORIGIN);
+    const page = await app.fetch(request('/terminal?x=1', 'GET', undefined, { host: `localhost:${PORT}` }));
+    expect(page.status).toBe(308);
+    expect(page.headers.get('location')).toBe(`${ORIGIN}/terminal?x=1`);
+    expect(calls).toHaveLength(0);
   });
 
   test('paper mutations require token, JSON and same origin', async () => {
